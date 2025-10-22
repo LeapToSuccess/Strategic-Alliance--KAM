@@ -1,1957 +1,1007 @@
-import React, { useState, useMemo, useCallback, useEffect } from 'react';
-
-import { Layers, Zap, TrendingUp, Cpu, Users, Award, PlusCircle, LogIn, CheckCircle, Sparkles, UserCheck } from 'lucide-react';
-
-import { initializeApp } from 'firebase/app';
-
-import {
-
-    getAuth,
-
-    signInAnonymously,
-
-    signInWithCustomToken,
-
-    onAuthStateChanged,
-
-    setPersistence,
-
-    browserLocalPersistence
-
-} from 'firebase/auth';
-
-import {
-
-    getFirestore,
-
-    collection,
-
-    doc,
-
-    onSnapshot,
-
-    addDoc,
-
-    updateDoc,
-
-    deleteDoc,
-
-    query,
-
-    setDoc,
-
-    setLogLevel,
-
-    getDoc, // Added for initial data check
-
-    getDocs // Added for initial data check
-
-} from 'firebase/firestore';
-
- 
-
-// --- CONFIGURATION AND INITIAL DATA ---
-
- 
-
-const LEAP_COLORS = {
-
-  BLUE: '#0078B5',
-
-  RED: '#D82C2C',
-
-  GREY: '#4D4D4D',
-
-};
-
- 
-
-const PILLARS = ["Product", "Delivery", "Service", "Relationship"];
-
-const TEAMS = ["Team A", "Team B", "Team C", "Team D"];
-
-const LOW_SCORE_THRESHOLD = 3.5; // Threshold for triggering the LLM suggestion
-
- 
-
-// Data models for seeding the database if it's empty
-
-const initialWeights = { Product: 0.20, Delivery: 0.25, Service: 0.25, Relationship: 0.30 };
-
-const initialScoresTemplate = PILLARS.flatMap(pillar =>
-
-  ['Communicate value', 'Route feedback', 'Share roadmap', 'Pre-empt risks', 'Review SLAs', 'Close escalations', 'Own problems', 'Offer solutions', 'Acknowledge emotions', 'Map stakeholders', 'Hold QBRs', 'Co-create value']
-
-    .filter((_, i) => PILLARS.indexOf(pillar) * 3 <= i && i < (PILLARS.indexOf(pillar) + 1) * 3)
-
-    .map(behavior => ({
-
-      pillar,
-
-      behavior,
-
-      // Default to 3 for initial fill
-
-      score: 3,
-
-    }))
-
-).slice(0, 12);
-
- 
-
-const initialTeamData = (teamName) => ({
-
-    teamName: teamName,
-
-    evidenceFactor: 1.0,
-
-    behaviorScores: initialScoresTemplate.map(item => ({...item, score: 3})),
-
-});
-
- 
-
- 
-
-// --- COMPONENTS ---
-
- 
-
-const ScoreInput = ({ score, onChange, disabled }) => (
-
-  <select
-
-    value={score}
-
-    onChange={(e) => onChange(parseInt(e.target.value, 10))}
-
-    className={`w-16 p-1 text-center border-2 rounded-lg cursor-pointer bg-white text-gray-800 focus:ring-4 transition ${disabled ? 'opacity-50 cursor-not-allowed bg-gray-100' : 'focus:ring-blue-300'}`}
-
-    style={{ borderColor: disabled ? '#ccc' : LEAP_COLORS.BLUE }}
-
-    disabled={disabled}
-
-  >
-
-    {[1, 2, 3, 4, 5].map(val => (
-
-      <option key={val} value={val}>{val}</option>
-
-    ))}
-
-  </select>
-
-);
-
- 
-
-const getRagClass = (score) => {
-
-  if (score >= 80) return "bg-green-100 text-green-700 border-green-300";
-
-  if (score >= 60) return "bg-yellow-100 text-yellow-700 border-yellow-300";
-
-  return "bg-red-100 text-red-700 border-red-300";
-
-};
-
- 
-
-const ScoreBar = ({ score, rank }) => {
-
-  const widthPercentage = `${Math.min(100, score)}%`;
-
-  const ragClass = getRagClass(score);
-
-  return (
-
-    <div className="flex items-center space-x-2 py-1">
-
-      <div className={`w-8 h-8 rounded-full flex items-center justify-center font-bold text-white shadow-md`} style={{ backgroundColor: LEAP_COLORS.BLUE }}>
-
-        {rank}
-
-      </div>
-
-      <div className="flex-grow bg-gray-200 rounded-full h-3">
-
-        <div
-
-          className={`h-3 rounded-full transition-all duration-700 ease-out shadow-inner ${ragClass.replace('bg-', 'bg-')}`}
-
-          style={{ width: widthPercentage, backgroundColor: ragClass.includes('green') ? '#10B981' : ragClass.includes('yellow') ? '#F59E0B' : LEAP_COLORS.RED }}
-
-        ></div>
-
-      </div>
-
-      <span className={`w-12 text-center font-bold text-lg p-1 rounded-lg border ${ragClass}`}>{score}</span>
-
-    </div>
-
-  );
-
-};
-
- 
-
-const LedgerRow = ({ item, onEdit, onDelete, isTrainer }) => {
-
-  const fields = ['area', 'action', 'owner', 'kpi', 'timeline', 'proof'];
-
-  return (
-
-    <tr className="hover:bg-blue-50 transition">
-
-      {fields.map((field) => (
-
-        <td key={field} className="px-4 py-3 text-sm text-gray-700">
-
-          <input
-
-            type="text"
-
-            value={item[field]}
-
-            onChange={(e) => onEdit(item.id, field, e.target.value)}
-
-            className="w-full p-1 border-b border-gray-300 focus:border-blue-500 bg-transparent text-sm"
-
-          />
-
-        </td>
-
-      ))}
-
-      <td className="px-4 py-3 text-sm text-center">
-
-        <button
-
-          onClick={() => onDelete(item.id)}
-
-          className="text-red-600 hover:text-red-800 transition p-1 rounded-full hover:bg-red-100"
-
-          title="Delete Commitment"
-
-        >
-
-          &times;
-
-        </button>
-
-      </td>
-
-    </tr>
-
-  );
-
-};
-
- 
-
-// --- TEAM SELECTION MODAL ---
-
- 
-
-const TeamSelectionModal = ({ teams, onSelect }) => {
-
-    const [selectedTeam, setSelectedTeam] = useState(teams[0]);
-
-    return (
-
-        <div className="fixed inset-0 bg-gray-900 bg-opacity-75 flex items-center justify-center z-50 p-4">
-
-            <div className="bg-white rounded-2xl shadow-2xl p-8 max-w-md w-full text-center">
-
-                <LogIn className="h-10 w-10 mx-auto mb-4" style={{ color: LEAP_COLORS.BLUE }} />
-
-                <h2 className="text-2xl font-bold mb-3" style={{ color: LEAP_COLORS.BLUE }}>Welcome to the Scoreboard!</h2>
-
-                <p className="text-gray-700 mb-6">Select your team or role to begin.</p>
-
-               
-
-                <div className="mb-4">
-
-                    <select
-
-                        value={selectedTeam}
-
-                        onChange={(e) => setSelectedTeam(e.target.value)}
-
-                        className="w-full p-3 border-2 rounded-lg text-lg focus:ring-4 transition"
-
-                        style={{ borderColor: LEAP_COLORS.BLUE }}
-
-                    >
-
-                        {teams.map(team => (
-
-                            <option key={team} value={team}>{team}</option>
-
-                        ))}
-
-                    </select>
-
-                </div>
-
-               
-
-                <button
-
-                    onClick={() => onSelect(selectedTeam)}
-
-                    className="w-full py-3 text-lg font-semibold rounded-lg text-white transition duration-300 shadow-md hover:shadow-lg mb-4"
-
-                    style={{ backgroundColor: LEAP_COLORS.BLUE }}
-
-                >
-
-                    <CheckCircle className="inline h-5 w-5 mr-2 mb-1" />
-
-                    Claim and Enter as {selectedTeam}
-
-                </button>
-
- 
-
-                <div className="border-t pt-4">
-
-                    <button
-
-                        onClick={() => onSelect('Trainer')}
-
-                        className="w-full py-2 text-md font-semibold rounded-lg transition duration-300 text-gray-700 border-2 border-gray-300 hover:bg-gray-100"
-
-                    >
-
-                        <UserCheck className="inline h-5 w-5 mr-2 mb-1" />
-
-                        Login as Trainer (Read-Only)
-
-                    </button>
-
-                </div>
-
-            </div>
-
-        </div>
-
-    );
-
-};
-
- 
-
- 
-
-// --- CORE APPLICATION COMPONENT ---
-
- 
-
-const App = () => {
-
-  const [activeTab, setActiveTab] = useState('Leaderboard');
-
-  const [weights, setWeights] = useState(initialWeights);
-
-  const [allTeamData, setAllTeamData] = useState({}); // { 'Team A': {behaviorScores: [], evidenceFactor: 1.0}, ... }
-
-  const [ledgerItems, setLedgerItems] = useState([]);
-
- 
-
-  // State for LLM interaction
-
-  const [llmStatus, setLlmStatus] = useState({
-
-    isLoading: false,
-
-    error: null,
-
-    message: null,
-
-    targetPillar: null
-
-  });
-
- 
-
-  // Firebase and Auth States
-
-  const [db, setDb] = useState(null);
-
-  const [auth, setAuth] = useState(null);
-
-  const [userId, setUserId] = useState(null);
-
-  const [isAuthReady, setIsAuthReady] = useState(false);
-
-  const [userRole, setUserRole] = useState(null); // 'Trainer' or 'Team A', 'Team B', etc.
-
- 
-
-  // --- Environment/Global Variable Access ---
-
-  const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
-
-  const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
-
-  const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
-
-  // ------------------------------------------
-
- 
-
-  const isTrainer = userRole === 'Trainer';
-
-  const userTeam = isTrainer ? null : userRole; // Null if Trainer
-
-  const currentTeamData = allTeamData[userTeam] || { behaviorScores: initialScoresTemplate, evidenceFactor: 1.0 };
-
- 
-
-  // --- FIREBASE INITIALIZATION & AUTH ---
-
-  useEffect(() => {
-
-    // Check if config exists before proceeding
-
-    if (!firebaseConfig) {
-
-        console.error('Firebase config is missing.');
-
-        return;
-
-    }
-
-   
-
-    try {
-
-      setLogLevel('debug');
-
-      const app = initializeApp(firebaseConfig);
-
-      const firestore = getFirestore(app);
-
-      const authInstance = getAuth(app);
-
-     
-
-      // Use browser persistence
-
-      setPersistence(authInstance, browserLocalPersistence);
-
- 
-
-      setDb(firestore);
-
-      setAuth(authInstance);
-
- 
-
-      onAuthStateChanged(authInstance, async (user) => {
-
-        let currentUid = null;
-
-        if (user) {
-
-            currentUid = user.uid;
-
-        } else if (initialAuthToken) {
-
-             try {
-
-                const credential = await signInWithCustomToken(authInstance, initialAuthToken);
-
-                currentUid = credential.user.uid;
-
-             } catch (e) {
-
-                console.error("Custom token sign in failed, falling back:", e);
-
-                const anonCredential = await signInAnonymously(authInstance);
-
-                currentUid = anonCredential.user.uid;
-
-             }
-
-        } else {
-
-            // No token, sign in anonymously
-
-            const anonCredential = await signInAnonymously(authInstance);
-
-            currentUid = anonCredential.user.uid;
-
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Strategic Alliance Scoreboard (Live)</title>
+    <!-- Tailwind CSS CDN for styling -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Lucide Icons Library (Loads globally as 'lucide') -->
+    <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.js"></script>
+    <style>
+        /* Custom styles for better visibility and layout */
+        body { font-family: 'Inter', sans-serif; }
+        .tab-content { min-height: 500px; }
+        .tab-button {
+            transition: all 0.2s ease;
         }
-
- 
-
-        setUserId(currentUid || crypto.randomUUID());
-
-        setIsAuthReady(true);
-
-      });
-
-    } catch (error) {
-
-      console.error("Firebase initialization failed:", error);
-
-    }
-
-  }, []);
-
- 
-
-  // --- INITIAL DATA SEEDING (Runs once after auth is ready) ---
-
-  // This is separated to avoid internal Firestore assertion errors by ensuring docs exist before listeners start.
-
-  useEffect(() => {
-
-    if (!db || !isAuthReady || !userId) return;
-
- 
-
-    const PUBLIC_DATA_PATH = `/artifacts/${appId}/public/data`;
-
-    const configRef = doc(db, `${PUBLIC_DATA_PATH}/scoreboard_config`, 'weights');
-
-    const teamCollectionRef = collection(db, `${PUBLIC_DATA_PATH}/team_inputs`);
-
-   
-
-    const seedData = async () => {
-
-        try {
-
-            console.log("Checking for initial data and seeding if necessary...");
-
-           
-
-            // Check and seed weights
-
-            const weightSnap = await getDoc(configRef);
-
-            if (!weightSnap.exists()) {
-
-                await setDoc(configRef, { weights: initialWeights });
-
-                console.log("Weights document created.");
-
-            }
-
- 
-
-            // Check and seed team inputs
-
-            const teamSnap = await getDocs(teamCollectionRef);
-
-            if (teamSnap.empty) {
-
-                console.log("Team input collection is empty. Seeding initial teams...");
-
-                // Note: using Promise.all to ensure all writes complete
-
-                await Promise.all(TEAMS.map(team =>
-
-                    setDoc(doc(teamCollectionRef, team), initialTeamData(team))
-
-                ));
-
-                console.log("Initial team inputs seeded.");
-
-            }
-
-        } catch (e) {
-
-            console.error("Error during initial data seeding:", e);
-
-        }
-
-    };
-
-   
-
-    seedData();
-
- 
-
-  }, [db, isAuthReady, appId, userId]);
-
- 
-
- 
-
-  // --- DATA SYNCHRONIZATION (onSnapshot) ---
-
-  useEffect(() => {
-
-    // CRITICAL: Only attach listeners after Auth is ready and userId is set.
-
-    if (!db || !isAuthReady || !userId) return;
-
- 
-
-    const PUBLIC_DATA_PATH = `/artifacts/${appId}/public/data`;
-
- 
-
-    // 1. Subscribe to Weights
-
-    const configRef = doc(db, `${PUBLIC_DATA_PATH}/scoreboard_config`, 'weights');
-
-    const unsubscribeWeights = onSnapshot(configRef, (docSnap) => {
-
-        if (docSnap.exists()) {
-
-            setWeights(docSnap.data().weights);
-
-        }
-
-    }, (e) => console.error("Weights subscription failed:", e));
-
- 
-
-    // 2. Subscribe to All Team Data (Scores & Evidence Factor)
-
-    const teamCollectionRef = collection(db, `${PUBLIC_DATA_PATH}/team_inputs`);
-
-    const unsubscribeTeams = onSnapshot(teamCollectionRef, (snapshot) => {
-
-        const teamDataMap = {};
-
-        snapshot.docs.forEach(doc => {
-
-            teamDataMap[doc.id] = doc.data();
-
+        /* Custom RAG classes for better visibility */
+        .rag-green { background-color: #C6EFCE; color: #006100; border-color: #A3D4AA; }
+        .rag-yellow { background-color: #FFEB9C; color: #7F6000; border-color: #FFDDAA; }
+        .rag-red { background-color: #FFC7CE; color: #9C0006; border-color: #FFAAAA; }
+        .rag-bar-green { background-color: #10B981; }
+        .rag-bar-yellow { background-color: #F59E0B; }
+        .rag-bar-red { background-color: #D82C2C; }
+    </style>
+    <script type="module">
+        // --- Import Firebase SDKs ---
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { 
+            getAuth, 
+            signInAnonymously, 
+            signInWithCustomToken, 
+            onAuthStateChanged,
+            setPersistence, 
+            browserLocalPersistence 
+        } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { 
+            getFirestore, 
+            collection, 
+            doc, 
+            onSnapshot, 
+            addDoc, 
+            setDoc, 
+            deleteDoc,
+            setLogLevel,
+            getDoc,
+            getDocs,
+            query as firestoreQuery
+        } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // --- GLOBAL CONFIGURATION AND INITIAL DATA ---
+        // Accessing global variables provided by the canvas environment
+        const __app_id = typeof window.__app_id !== 'undefined' ? window.__app_id : 'default-app-id';
+        const __firebase_config = typeof window.__firebase_config !== 'undefined' ? JSON.parse(window.__firebase_config) : null;
+        const __initial_auth_token = typeof window.__initial_auth_token !== 'undefined' ? window.__initial_auth_token : null;
+        
+        const LEAP_COLORS = {
+            BLUE: '#0078B5',
+            RED: '#D82C2C',
+            GREY: '#4D4D4D',
+        };
+
+        const PILLARS = ["Product", "Delivery", "Service", "Relationship"];
+        const TEAMS = ["Team A", "Team B", "Team C", "Team D"];
+        const LOW_SCORE_THRESHOLD = 3.5;
+        const PUBLIC_DATA_PATH = `/artifacts/${__app_id}/public/data`;
+        const PRIVATE_DATA_PATH = (uid) => `/artifacts/${__app_id}/users/${uid}/private`;
+
+        const initialWeights = { Product: 0.20, Delivery: 0.25, Service: 0.25, Relationship: 0.30 };
+        const initialScoresTemplate = PILLARS.flatMap(pillar => 
+            ['Communicate value', 'Route feedback', 'Share roadmap', 'Pre-empt risks', 'Review SLAs', 'Close escalations', 'Own problems', 'Offer solutions', 'Acknowledge emotions', 'Map stakeholders', 'Hold QBRs', 'Co-create value']
+            .filter((_, i) => PILLARS.indexOf(pillar) * 3 <= i && i < (PILLARS.indexOf(pillar) + 1) * 3)
+            .map(behavior => ({ pillar, behavior, score: 3 }))
+        ).slice(0, 12);
+
+        const initialTeamData = (teamName) => ({
+            teamName: teamName,
+            evidenceFactor: 1.0,
+            behaviorScores: initialScoresTemplate.map(item => ({...item, score: 3})),
         });
 
-        setAllTeamData(teamDataMap);
-
-    }, (e) => console.error("Teams subscription failed:", e));
-
- 
-
-    // 3. Subscribe to Alliance Ledger
-
-    const ledgerCollectionRef = collection(db, `${PUBLIC_DATA_PATH}/alliance_ledger`);
-
-    const unsubscribeLedger = onSnapshot(ledgerCollectionRef, (snapshot) => {
-
-        const items = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-
-        setLedgerItems(items.sort((a, b) => (a.id > b.id) ? 1 : -1));
-
-    }, (e) => console.error("Ledger subscription failed:", e));
-
- 
-
-    // 4. Check user's claimed role (Private Data)
-
-    // Path: /artifacts/{appId}/users/{userId}/user_settings/role_claim
-
-    const userRoleRef = doc(db, `/artifacts/${appId}/users/${userId}/user_settings`, 'role_claim');
-
-    const unsubscribeUserRole = onSnapshot(userRoleRef, (docSnap) => {
-
-        if (docSnap.exists() && docSnap.data().roleName) {
-
-            setUserRole(docSnap.data().roleName);
-
-        }
-
-    }, (e) => console.error("Role claim subscription failed:", e));
-
- 
-
-    return () => {
-
-        // Cleanup all listeners to prevent memory leaks and assertion errors
-
-        unsubscribeWeights();
-
-        unsubscribeTeams();
-
-        unsubscribeLedger();
-
-        unsubscribeUserRole();
-
-    };
-
-  }, [db, isAuthReady, appId, userId]);
-
- 
-
- 
-
-  // --- FIRESTORE WRITE OPERATIONS ---
-
- 
-
-  // Handle team or role claim from modal
-
-  const handleRoleClaim = async (roleName) => {
-
-    if (!db || !userId) return;
-
-    try {
-
-        // Store the claim in the user's private data space.
-
-        const userRoleRef = doc(db, `/artifacts/${appId}/users/${userId}/user_settings`, 'role_claim');
-
-        await setDoc(userRoleRef, { roleName: roleName, claimedAt: new Date().toISOString() });
-
-        setUserRole(roleName);
-
-    } catch (e) {
-
-        console.error("Error claiming role:", e);
-
-    }
-
-  };
-
- 
-
- 
-
-  // Function to update behavior score in Firestore (Only for current user's team)
-
-  const handleScoreChange = useCallback(async (team, index, newScore) => {
-
-    if (!db || team !== userTeam) return;
-
- 
-
-    const teamRef = doc(db, `/artifacts/${appId}/public/data/team_inputs`, team);
-
-    const teamData = allTeamData[team];
-
- 
-
-    const updatedScores = teamData.behaviorScores.map((item, i) =>
-
-      i === index ? { ...item, score: newScore } : item
-
-    );
-
-   
-
-    try {
-
-        await setDoc(teamRef, {
-
-            ...teamData,
-
-            behaviorScores: updatedScores
-
-        });
-
-    } catch (e) {
-
-        console.error("Error updating score:", e);
-
-    }
-
-  }, [db, userTeam, allTeamData, appId]);
-
- 
-
-  // Function to update pillar weights in Firestore (Trainer cannot edit)
-
-  const handleWeightChange = useCallback(async (pillar, newWeight) => {
-
-    if (!db || isTrainer) return;
-
-   
-
-    const configRef = doc(db, `/artifacts/${appId}/public/data/scoreboard_config`, 'weights');
-
-    const newWeights = { ...weights, [pillar]: newWeight };
-
-    try {
-
-        await setDoc(configRef, { weights: newWeights });
-
-    } catch (e) {
-
-        console.error("Error updating weights:", e);
-
-    }
-
-  }, [db, weights, appId, isTrainer]);
-
- 
-
-  // Function to update evidence factor in Firestore (Trainer cannot edit)
-
-  const handleEvidenceFactorChange = useCallback(async (team, newFactor) => {
-
-    if (!db || team !== userTeam || isTrainer) return;
-
- 
-
-    const teamRef = doc(db, `/artifacts/${appId}/public/data/team_inputs`, team);
-
-    const teamData = allTeamData[team];
-
- 
-
-    try {
-
-        await setDoc(teamRef, {
-
-            ...teamData,
-
-            evidenceFactor: parseFloat(newFactor) || 0
-
-        }, { merge: true });
-
-    } catch (e) {
-
-        console.error("Error updating evidence factor:", e);
-
-    }
-
-  }, [db, userTeam, allTeamData, appId, isTrainer]);
-
- 
-
- 
-
-  // --- Ledger Handlers (Public Collection - Editable by Teams & Trainer) ---
-
-  const handleLedgerEdit = useCallback(async (id, field, value) => {
-
-    if (!db) return;
-
-    const itemRef = doc(db, `/artifacts/${appId}/public/data/alliance_ledger`, id);
-
-    try {
-
-      await setDoc(itemRef, { [field]: value }, { merge: true });
-
-    } catch (e) {
-
-      console.error("Error updating ledger item:", e);
-
-    }
-
-  }, [db, appId]);
-
- 
-
-  const handleLedgerAdd = useCallback(async () => {
-
-    if (!db) return;
-
-    const newCommitment = {
-
-      area: 'New',
-
-      action: 'Enter commitment here',
-
-      owner: userRole || userId,
-
-      kpi: 'Define success metric',
-
-      timeline: 'MM/YYYY',
-
-      proof: '',
-
-    };
-
-    try {
-
-        await addDoc(collection(db, `/artifacts/${appId}/public/data/alliance_ledger`), newCommitment);
-
-    } catch (e) {
-
-        console.error("Error adding ledger item:", e);
-
-    }
-
-  }, [db, userRole, userId, appId]);
-
- 
-
-  const handleLedgerDelete = useCallback(async (id) => {
-
-    if (!db) return;
-
-    try {
-
-        await deleteDoc(doc(db, `/artifacts/${appId}/public/data/alliance_ledger`, id));
-
-    } catch (e) {
-
-        console.error("Error deleting ledger item:", e);
-
-    }
-
-  }, [db, appId]);
-
-  // --- End Ledger Handlers ---
-
- 
-
- 
-
-  // --- Core Calculation Logic (Replicating Leaderboard formulas) ---
-
-  const { leaderboard, teamPillarAverages } = useMemo(() => {
-
-    const teamScores = {};
-
-    const teamRadarData = {};
-
-    const allTeams = Object.keys(allTeamData);
-
- 
-
-    // 1. Calculate Radar Data (Pillar Averages)
-
-    allTeams.forEach(team => {
-
-        const teamData = allTeamData[team];
-
-        teamRadarData[team] = {};
-
-       
-
-        PILLARS.forEach(pillar => {
-
-            const pillarScores = teamData.behaviorScores
-
-                .filter(item => item.pillar === pillar)
-
-                .map(item => item.score);
-
-           
-
-            const average = pillarScores.length > 0
-
-                ? pillarScores.reduce((sum, score) => sum + score, 0) / pillarScores.length
-
-                : 0;
-
- 
-
-            teamRadarData[team][pillar] = average;
-
-        });
-
-    });
-
- 
-
-    // 2. Calculate Account Health (SUMPRODUCT equivalent)
-
-    allTeams.forEach(team => {
-
-        let sumproduct = 0;
-
-        PILLARS.forEach(pillar => {
-
-            // SUMPRODUCT(Settings!Weights, Radar_Data!Averages)
-
-            sumproduct += weights[pillar] * (teamRadarData[team][pillar] || 0);
-
-        });
-
- 
-
-        // Final Account Health Score (ROUND(20 * SUMPRODUCT * EvidenceFactor, 0))
-
-        const score = Math.round(20 * sumproduct * (allTeamData[team].evidenceFactor || 1.0));
-
-        teamScores[team] = score;
-
-    });
-
- 
-
-    // 3. Calculate Rank (RANK.EQ equivalent)
-
-    const scoresArray = Object.entries(teamScores)
-
-      .map(([team, score]) => ({ team, score }));
-
- 
-
-    const sortedScores = [...scoresArray].sort((a, b) => b.score - a.score);
-
- 
-
-    const leaderboard = scoresArray.map(item => {
-
-      const rank = sortedScores.findIndex(s => s.score === item.score) + 1;
-
-      return {
-
-        team: item.team,
-
-        score: item.score,
-
-        evidenceFactor: allTeamData[item.team].evidenceFactor || 1.0,
-
-        rank: rank,
-
-        radar: teamRadarData[item.team],
-
-      };
-
-    });
-
- 
-
-    return { leaderboard, teamPillarAverages: teamRadarData };
-
-  }, [weights, allTeamData]);
-
- 
-
-  // Current user's pillar averages for the LLM feature
-
-  const currentUserPillarAverages = teamPillarAverages[userTeam] || {};
-
- 
-
-  // --- GEMINI API INTEGRATION: ACTION PLAN GENERATOR ---
-
- 
-
-  const generateActionPlan = useCallback(async (pillar, teamScores) => {
-
-    if (!db || !userTeam || llmStatus.isLoading) return;
-
- 
-
-    setLlmStatus({ isLoading: true, error: null, message: null, targetPillar: pillar });
-
- 
-
-    const GEMINI_API_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=`;
-
-    const apiKey = "";
-
- 
-
-    const scoresList = teamScores
-
-        .filter(item => item.pillar === pillar)
-
-        .map(item => `Behavior: "${item.behavior}" Score: ${item.score}/5`)
-
-        .join('\n');
-
- 
-
-    const systemPrompt = `You are a highly analytical Strategic Performance Coach specializing in alliance management. Your goal is to analyze a team's behavior scores in a specific pillar and generate a concise, actionable improvement plan. The plan MUST be formatted as a JSON array of specific actions.`;
-
- 
-
-    const userQuery = `Analyze the following behavior scores for the "${pillar}" pillar for ${userTeam}. The maximum score is 5.
-
-Scores:
-
-${scoresList}
-
- 
-
-Based on these low scores (average below ${LOW_SCORE_THRESHOLD}), provide a summary of the root cause and a 3-point action plan. Each action must be a simple, concrete task suitable for a 30-day commitment, focusing on the lowest scoring behaviors.`;
-
- 
-
-    const payload = {
-
-        contents: [{ parts: [{ text: userQuery }] }],
-
-        systemInstruction: { parts: [{ text: systemPrompt }] },
-
-        generationConfig: {
-
-            responseMimeType: "application/json",
-
-            responseSchema: {
-
-                type: "OBJECT",
-
-                properties: {
-
-                    summary: { type: "STRING", description: "A brief, professional summary of the core issue identified." },
-
-                    actions: {
-
-                        type: "ARRAY",
-
-                        description: "3 concrete, short-term actions to improve scores in this pillar.",
-
-                        items: {
-
-                            type: "OBJECT",
-
-                            properties: {
-
-                                action: { type: "STRING", description: "The specific task, e.g., 'Draft and socialize QBR agenda template.'" },
-
-                                kpi: { type: "STRING", description: "The success metric, e.g., 'Template approved by management.'" }
-
-                            }
-
-                        }
-
-                    }
-
-                }
-
-            }
-
-        }
-
-    };
-
- 
-
-    let attempts = 0;
-
-    const maxRetries = 3;
-
- 
-
-    while (attempts < maxRetries) {
-
-        attempts++;
-
-        try {
-
-            const response = await fetch(GEMINI_API_URL, {
-
-                method: 'POST',
-
-                headers: { 'Content-Type': 'application/json' },
-
-                body: JSON.stringify(payload)
-
+        // --- GLOBAL STATE ---
+        let db = null;
+        let auth = null;
+        let userId = null;
+        let isAuthReady = false;
+        let userRole = null; // 'Trainer' or 'Team A', 'Team B', etc.
+        let weights = initialWeights;
+        let allTeamData = {};
+        let ledgerItems = [];
+        let llmStatus = { isLoading: false, error: null, message: null, targetPillar: null };
+        let activeTab = 'Leaderboard';
+        
+        // --- UTILITY FUNCTIONS ---
+        const getIsTrainer = () => userRole === 'Trainer';
+        const getUserTeam = () => getIsTrainer() ? null : userRole; 
+
+        const getRagClass = (score) => {
+            if (score >= 80) return "rag-green";
+            if (score >= 60) return "rag-yellow";
+            return "rag-red";
+        };
+        const getRagBarClass = (score) => {
+            if (score >= 80) return "rag-bar-green";
+            if (score >= 60) return "rag-bar-yellow";
+            return "rag-bar-red";
+        };
+
+        const generateUniqueId = () => Date.now().toString(36) + Math.random().toString(36).substring(2, 5);
+
+        // --- CORE CALCULATIONS (LEADERBOARD) ---
+        const calculateLeaderboardData = () => {
+            const teamScores = {};
+            const teamRadarData = {};
+            const allTeamKeys = Object.keys(allTeamData);
+
+            // 1. Calculate Radar Data (Pillar Averages)
+            allTeamKeys.forEach(team => {
+                const teamData = allTeamData[team];
+                teamRadarData[team] = {};
+                
+                PILLARS.forEach(pillar => {
+                    const pillarScores = teamData.behaviorScores
+                        .filter(item => item.pillar === pillar)
+                        .map(item => item.score);
+                    
+                    const average = pillarScores.length > 0
+                        ? pillarScores.reduce((sum, score) => sum + score, 0) / pillarScores.length
+                        : 0;
+
+                    teamRadarData[team][pillar] = average;
+                });
             });
 
- 
-
-            if (!response.ok) {
-
-                // Throw error to trigger retry logic
-
-                throw new Error(`HTTP error! status: ${response.status}`);
-
-            }
-
- 
-
-            const result = await response.json();
-
-            const textJson = result.candidates?.[0]?.content?.parts?.[0]?.text;
-
- 
-
-            if (!textJson) {
-
-                 throw new Error("Gemini returned empty or invalid content.");
-
-            }
-
- 
-
-            const parsedResult = JSON.parse(textJson);
-
- 
-
-            // Add actions to Ledger
-
-            for (const item of parsedResult.actions) {
-
-                const newCommitment = {
-
-                    area: pillar,
-
-                    action: item.action,
-
-                    owner: userTeam,
-
-                    kpi: item.kpi,
-
-                    timeline: '30 Days',
-
-                    proof: 'LLM generated',
-
-                };
-
-                await addDoc(collection(db, `/artifacts/${appId}/public/data/alliance_ledger`), newCommitment);
-
-            }
-
-           
-
-            // Success
-
-            setLlmStatus({
-
-                isLoading: false,
-
-                error: null,
-
-                targetPillar: null,
-
-                message: `Success! Plan generated for ${pillar}. Summary: ${parsedResult.summary}. 3 commitments added to Ledger.`,
-
-            });
-
-            return;
-
- 
-
-        } catch (e) {
-
-            console.error(`Attempt ${attempts} failed:`, e);
-
-            if (attempts < maxRetries) {
-
-                const delay = Math.pow(2, attempts) * 1000;
-
-                await new Promise(resolve => setTimeout(resolve, delay));
-
-            } else {
-
-                setLlmStatus({
-
-                    isLoading: false,
-
-                    error: `Failed to generate plan after ${maxRetries} attempts.`,
-
-                    targetPillar: null,
-
-                    message: null
-
+            // 2. Calculate Account Health (SUMPRODUCT equivalent)
+            allTeamKeys.forEach(team => {
+                let sumproduct = 0;
+                PILLARS.forEach(pillar => {
+                    sumproduct += weights[pillar] * (teamRadarData[team][pillar] || 0);
                 });
 
+                // Final Account Health Score (ROUND(20 * SUMPRODUCT * EvidenceFactor, 0))
+                const evidenceFactor = allTeamData[team]?.evidenceFactor || 1.0;
+                const score = Math.round(20 * sumproduct * evidenceFactor);
+                teamScores[team] = score;
+            });
+
+            // 3. Calculate Rank (RANK.EQ equivalent)
+            const scoresArray = Object.entries(teamScores).map(([team, score]) => ({ team, score }));
+            const sortedScores = [...scoresArray].sort((a, b) => b.score - a.score);
+
+            const leaderboard = scoresArray.map(item => {
+                // Find rank by finding the first index of a score greater than or equal to current score
+                const rank = sortedScores.findIndex(s => s.score === item.score) + 1;
+                return {
+                    team: item.team,
+                    score: item.score,
+                    evidenceFactor: allTeamData[item.team]?.evidenceFactor || 1.0,
+                    rank: rank,
+                    radar: teamRadarData[item.team],
+                };
+            });
+
+            // 4. Sort by Rank
+            leaderboard.sort((a, b) => a.rank - b.rank);
+
+            return { leaderboard };
+        };
+
+        // --- LLM (GEMINI) LOGIC ---
+
+        const generateImprovementPlan = async (pillar, lowScores) => {
+            if (llmStatus.isLoading) return;
+            llmStatus = { isLoading: true, error: null, message: `Generating plan for ${pillar}...` };
+            renderApp();
+
+            const prompt = `Act as a Strategic Performance Coach for a B2B alliance team. The team is scoring low in the "${pillar}" pillar, specifically on these behaviors (score is 1-5, 5 is best): ${JSON.stringify(lowScores)}. Your goal is to provide a plan to improve. Based ONLY on the provided scores and pillar focus:
+            1. Summarize the core weakness in one sentence.
+            2. Provide exactly 3 actionable, specific improvement tasks.
+            3. For each task, define a relevant Key Performance Indicator (KPI) and a Target Timeline (30 days, 60 days, etc.).
+            
+            Return the result as a JSON array of objects, structured by the responseSchema provided.`;
+
+            const apiKey = "";
+            const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`;
+
+            const payload = {
+                contents: [{ parts: [{ text: prompt }] }],
+                systemInstruction: { parts: [{ text: "You are a concise, action-oriented business coach. Focus on measurable outcomes." }] },
+                generationConfig: {
+                    responseMimeType: "application/json",
+                    responseSchema: {
+                        type: "ARRAY",
+                        items: {
+                            type: "OBJECT",
+                            properties: {
+                                "area": { "type": "STRING", "description": "The strategic pillar (e.g., Product, Service)." },
+                                "action": { "type": "STRING", "description": "The specific task to be performed." },
+                                "kpi": { "type": "STRING", "description": "The measurable outcome (e.g., 'Increase feedback routes by 50%')." },
+                                "timeline": { "type": "STRING", "description": "The target duration (e.g., 30 days)." },
+                            },
+                            "required": ["area", "action", "kpi", "timeline"]
+                        }
+                    }
+                }
+            };
+
+            try {
+                const response = await fetch(apiUrl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+
+                const result = await response.json();
+
+                const jsonString = result?.candidates?.[0]?.content?.parts?.[0]?.text;
+                if (!jsonString) throw new Error("LLM returned empty or invalid response.");
+                
+                let plan = JSON.parse(jsonString);
+
+                // Add to ledger
+                for (const item of plan) {
+                    await handleLedgerAdd(item.area, item.action, item.kpi, item.timeline);
+                }
+
+                llmStatus = { 
+                    isLoading: false, 
+                    message: `✅ Plan added to Ledger for ${pillar}!`, 
+                    targetPillar: pillar 
+                };
+                
+            } catch (e) {
+                console.error("Gemini API Error:", e);
+                llmStatus = { isLoading: false, error: "Failed to generate plan. Check console.", targetPillar: pillar };
+            }
+            renderApp();
+        };
+
+        // --- FIREBASE WRITE OPERATIONS (Mutators) ---
+
+        const handleTeamClaim = async (role) => {
+            if (!db || !userId) return;
+            userRole = role; // Set role optimistically
+            
+            try {
+                // Store the claim in the user's private data space
+                const userRoleRef = doc(db, PRIVATE_DATA_PATH(userId), 'role_claim');
+                await setDoc(userRoleRef, { role: role, claimedAt: new Date().toISOString() });
+            } catch (e) {
+                console.error("Error claiming role:", e);
+            }
+            renderApp();
+        };
+
+        const handleScoreChange = async (team, index, newScore) => {
+            if (!db || getUserTeam() !== team || getIsTrainer()) return; 
+
+            const teamRef = doc(db, `${PUBLIC_DATA_PATH}/team_inputs`, team);
+            const currentData = allTeamData[team];
+            
+            const updatedScores = currentData.behaviorScores.map((item, i) => 
+                i === index ? { ...item, score: newScore } : item
+            );
+            
+            try {
+                await setDoc(teamRef, { 
+                    ...currentData, 
+                    behaviorScores: updatedScores 
+                });
+            } catch (e) {
+                console.error("Error updating score:", e);
+            }
+        };
+
+        const handleWeightChange = async (pillar, newWeight) => {
+            if (!db || !getIsTrainer()) return; // Only Trainer can edit weights
+            const configRef = doc(db, `${PUBLIC_DATA_PATH}/scoreboard_config`, 'weights');
+            const newWeights = { ...weights, [pillar]: newWeight };
+            try {
+                await setDoc(configRef, { weights: newWeights });
+            } catch (e) {
+                console.error("Error updating weights:", e);
+            }
+        };
+
+        const handleEvidenceFactorChange = async (team, newFactor) => {
+            if (!db || getUserTeam() !== team || getIsTrainer()) return;
+
+            const teamRef = doc(db, `${PUBLIC_DATA_PATH}/team_inputs`, team);
+            const currentData = allTeamData[team];
+
+            try {
+                await setDoc(teamRef, { 
+                    ...currentData,
+                    evidenceFactor: parseFloat(newFactor) || 0
+                });
+            } catch (e) {
+                console.error("Error updating evidence factor:", e);
+            }
+        };
+
+        // --- Ledger Handlers ---
+
+        const handleLedgerEdit = async (id, field, value) => {
+            if (!db || !userRole) return; // Trainer or Team can edit ledger
+            const itemRef = doc(db, `${PUBLIC_DATA_PATH}/alliance_ledger`, id);
+            try {
+                await setDoc(itemRef, { [field]: value, owner: userRole }, { merge: true });
+            } catch (e) {
+                console.error("Error updating ledger item:", e);
+            }
+        };
+
+        const handleLedgerAdd = async (area = 'New Commitment', action = 'Enter commitment here', kpi = 'Define success metric', timeline = '30 days') => {
+            if (!db || !userRole) return; 
+            const newCommitment = {
+                area: area,
+                action: action,
+                owner: getUserTeam() || userRole, // Use Trainer or the Team
+                kpi: kpi,
+                timeline: timeline,
+                proof: '',
+            };
+            try {
+                await addDoc(collection(db, `${PUBLIC_DATA_PATH}/alliance_ledger`), newCommitment);
+            } catch (e) {
+                console.error("Error adding ledger item:", e);
+            }
+        };
+
+        const handleLedgerDelete = async (id) => {
+            if (!db || !userRole) return;
+            try {
+                await deleteDoc(doc(db, `${PUBLIC_DATA_PATH}/alliance_ledger`, id));
+            } catch (e) {
+                console.error("Error deleting ledger item:", e);
+            }
+        };
+
+        // --- RENDER FUNCTIONS ---
+
+        const renderUserStatus = () => {
+            const container = document.getElementById('user-status');
+            if (!container) return;
+
+            if (!isAuthReady) {
+                container.innerHTML = `<span class="text-sm text-gray-500">Connecting...</span>`;
+                return;
             }
 
-        }
+            if (!userRole) {
+                container.innerHTML = `<span class="text-sm font-semibold" style="color:${LEAP_COLORS.RED}">Please select your role</span>`;
+                return;
+            }
 
-    }
+            const roleDisplay = getIsTrainer() ? 
+                `<span class="font-extrabold" style="color:${LEAP_COLORS.RED}">${userRole} (Read-Only)</span>` : 
+                `<span class="font-extrabold" style="color:${LEAP_COLORS.RED}">${userRole}</span>`;
 
-  }, [db, userTeam, llmStatus.isLoading, appId]);
+            container.innerHTML = `
+                <span class="text-white text-sm">
+                    Logged in as: ${roleDisplay}
+                    <span class="font-mono text-xs text-gray-300 ml-2">ID: ${userId}</span>
+                </span>
+            `;
+        };
 
- 
+        const renderTeamSelectionModal = () => {
+            const modal = document.getElementById('team-selection-modal');
+            if (!modal) return;
 
- 
+            if (userRole) {
+                modal.classList.add('hidden');
+                return;
+            } else {
+                modal.classList.remove('hidden');
+            }
 
-  // --- VIEW RENDERERS ---
+            const teamList = document.getElementById('team-list');
+            teamList.innerHTML = TEAMS.map(team => `
+                <option value="${team}">${team}</option>
+            `).join('');
 
- 
+            document.getElementById('select-team-button').onclick = () => {
+                const selectedTeam = teamList.value;
+                if (selectedTeam) handleTeamClaim(selectedTeam);
+            };
 
-  const renderLeaderboard = () => (
+            document.getElementById('login-trainer-button').onclick = () => {
+                handleTeamClaim('Trainer');
+            };
+        };
 
-    <div className="p-4 space-y-8">
+        const renderLeaderboard = () => {
+            const container = document.getElementById('leaderboard-content');
+            if (!container) return;
+            
+            const { leaderboard } = calculateLeaderboardData();
 
-      {/* User Information */}
+            const leaderboardHtml = leaderboard.map(team => {
+                const ragClass = getRagClass(team.score);
+                const ragBarClass = getRagBarClass(team.score);
+                const widthPercentage = `${Math.min(100, team.score)}%`;
 
-      <div className="bg-white shadow-md rounded-lg p-3 text-center text-sm font-medium" style={{ border: `2px solid ${LEAP_COLORS.BLUE}` }}>
+                return `
+                    <div class="border-b pb-4 last:pb-0 last:border-b-0">
+                        <div class="flex justify-between items-center mb-2">
+                            <h3 class="text-xl font-semibold text-gray-800">${team.team}</h3>
+                            <div class="flex items-center space-x-4">
+                                <label class="text-sm font-medium text-gray-600">Evidence Factor (0-1):</label>
+                                <input
+                                    type="number"
+                                    min="0"
+                                    max="1"
+                                    step="0.1"
+                                    value="${team.evidenceFactor}"
+                                    data-team="${team.team}"
+                                    data-type="evidence"
+                                    onchange="window.app.handleEvidenceFactorChange(this.dataset.team, this.value)"
+                                    class="w-20 p-2 border-2 rounded-lg text-center font-mono focus:ring-4 transition ${getUserTeam() !== team.team || getIsTrainer() ? 'bg-gray-100 opacity-70 cursor-not-allowed' : ''}"
+                                    style="border-color: ${LEAP_COLORS.BLUE};"
+                                    ${getUserTeam() !== team.team || getIsTrainer() ? 'disabled' : ''}
+                                />
+                            </div>
+                        </div>
+                        <div class="flex items-center space-x-2 py-1">
+                            <div class="w-8 h-8 rounded-full flex items-center justify-center font-bold text-white shadow-md" style="background-color: ${LEAP_COLORS.BLUE};">
+                                ${team.rank}
+                            </div>
+                            <div class="flex-grow bg-gray-200 rounded-full h-3">
+                                <div 
+                                    class="h-3 rounded-full transition-all duration-700 ease-out shadow-inner ${ragBarClass}" 
+                                    style="width: ${widthPercentage};"
+                                ></div>
+                            </div>
+                            <span class="w-12 text-center font-bold text-lg p-1 rounded-lg border ${ragClass}">${team.score}</span>
+                        </div>
+                    </div>
+                `;
+            }).join('');
 
-          You are currently signed in as <span className="font-mono text-xs text-gray-600">{userId}</span>.
-
-          You are logged in as role:
-
-          <span className="font-extrabold ml-1" style={{ color: LEAP_COLORS.RED }}>{userRole || 'Unclaimed'}</span>.
-
-      </div>
-
- 
-
-      <div className="bg-white shadow-xl rounded-2xl p-6">
-
-        <h2 className="text-2xl font-extrabold mb-4" style={{ color: LEAP_COLORS.BLUE }}><Award className="inline h-6 w-6 mb-1 mr-2" />Strategic Alliance Leaderboard</h2>
-
-        <div className="space-y-4">
-
-          {leaderboard.map(team => (
-
-            <div key={team.team} className="border-b pb-4 last:pb-0 last:border-b-0">
-
-              <div className="flex justify-between items-center mb-2">
-
-                <h3 className="text-xl font-semibold text-gray-800">{team.team}</h3>
-
-                <div className="flex items-center space-x-4">
-
-                  <label className="text-sm font-medium text-gray-600">Evidence Factor (0-1):</label>
-
-                  <input
-
-                    type="number"
-
-                    min="0"
-
-                    max="1"
-
-                    step="0.1"
-
-                    value={team.evidenceFactor}
-
-                    onChange={(e) => handleEvidenceFactorChange(team.team, e.target.value)}
-
-                    className={`w-20 p-2 border-2 rounded-lg text-center font-mono focus:ring-4 transition ${team.team !== userTeam || isTrainer ? 'bg-gray-100 opacity-70 cursor-not-allowed' : ''}`}
-
-                    style={{ borderColor: LEAP_COLORS.BLUE }}
-
-                    disabled={team.team !== userTeam || isTrainer}
-
-                  />
-
+            const radarHtml = leaderboard.map(team => `
+                <div class="p-4 border border-gray-200 rounded-xl shadow-inner">
+                    <h4 class="text-lg font-bold mb-3" style="color: ${LEAP_COLORS.GREY};">${team.team} Averages</h4>
+                    ${PILLARS.map(pillar => `
+                        <div class="mb-2">
+                            <p class="text-sm font-medium">${pillar} Excellence:</p>
+                            <div class="flex items-center space-x-2">
+                                <div class="flex-grow bg-gray-100 rounded-full h-2.5">
+                                    <div 
+                                        class="h-2.5 rounded-full transition-all duration-500" 
+                                        style="width: ${((team.radar[pillar] || 0) / 5) * 100}%; background-color: ${LEAP_COLORS.BLUE};"
+                                    ></div>
+                                </div>
+                                <span class="text-xs font-semibold" style="color: ${LEAP_COLORS.BLUE};">${(team.radar[pillar] || 0).toFixed(2)}</span>
+                            </div>
+                        </div>
+                    `).join('')}
                 </div>
+            `).join('');
 
-              </div>
 
-              <ScoreBar score={team.score} rank={team.rank} />
+            container.innerHTML = `
+                <div class="p-4 space-y-8">
+                    <div class="bg-white shadow-xl rounded-2xl p-6">
+                        <h2 class="text-2xl font-extrabold mb-4" style="color: ${LEAP_COLORS.BLUE};">
+                            <i data-lucide="award" class="h-6 w-6 mb-1 mr-2 inline"></i>Strategic Alliance Leaderboard
+                        </h2>
+                        <div class="space-y-4">
+                            ${leaderboardHtml}
+                        </div>
+                    </div>
+                    
+                    <div class="bg-white shadow-xl rounded-2xl p-6">
+                        <h2 class="text-2xl font-extrabold mb-4" style="color: ${LEAP_COLORS.BLUE};">
+                            <i data-lucide="zap" class="h-6 w-6 mb-1 mr-2 inline"></i>Pillar Radar Data (Averages)
+                        </h2>
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                            ${radarHtml}
+                        </div>
+                    </div>
+                </div>
+            `;
+            // Initialize lucide icons for this content
+            lucide.createIcons();
+        };
 
-            </div>
+        const renderBehaviors = () => {
+            const container = document.getElementById('behaviors-content');
+            if (!container) return;
 
-          ))}
+            const userTeam = getUserTeam();
+            const isEditable = !getIsTrainer() && userTeam;
+            
+            const teamData = allTeamData[userTeam] || initialTeamData(userTeam || 'Team A');
 
-        </div>
+            // Calculate pillar averages for LLM button logic
+            const pillarAverages = {};
+            PILLARS.forEach(pillar => {
+                const pillarScores = teamData.behaviorScores
+                    .filter(item => item.pillar === pillar)
+                    .map(item => item.score);
+                pillarAverages[pillar] = pillarScores.length > 0
+                    ? pillarScores.reduce((sum, score) => sum + score, 0) / pillarScores.length
+                    : 0;
+            });
 
-      </div>
+            const llmButtons = PILLARS.map(pillar => {
+                const avg = pillarAverages[pillar];
+                if (avg < LOW_SCORE_THRESHOLD && userTeam) {
+                    const lowScores = teamData.behaviorScores
+                        .filter(item => item.pillar === pillar)
+                        .map(item => ({ behavior: item.behavior, score: item.score }));
 
-     
+                    const isTarget = llmStatus.targetPillar === pillar;
+                    const buttonText = isTarget && llmStatus.isLoading ? 
+                        `<i data-lucide="loader-2" class="h-5 w-5 mr-2 inline animate-spin"></i> Generating Plan...` :
+                        `✨ Generate Improvement Plan for ${pillar} (${avg.toFixed(2)})`;
+                    
+                    const buttonClass = isTarget && llmStatus.isLoading ? 
+                        `bg-gray-500 hover:bg-gray-600 cursor-wait` : 
+                        `bg-red-500 hover:bg-red-600 transition`;
 
-      {/* Radar Chart Placeholder (Simple Visualization) */}
+                    return `
+                        <div class="p-3 bg-red-50 rounded-lg shadow-inner flex justify-between items-center mb-3">
+                            <p class="text-sm font-semibold text-red-700">LOW SCORE ALERT: ${pillar} average is below ${LOW_SCORE_THRESHOLD}.</p>
+                            <button
+                                onclick="window.app.generateImprovementPlanWrapper('${pillar}', ${JSON.stringify(lowScores).replace(/"/g, '&quot;')})"
+                                class="flex items-center px-3 py-2 text-sm font-semibold rounded-lg text-white shadow-md ${buttonClass}"
+                                style="background-color: ${isTarget && llmStatus.isLoading ? '#6B7280' : LEAP_COLORS.RED};"
+                                ${llmStatus.isLoading ? 'disabled' : ''}
+                            >
+                                ${buttonText}
+                            </button>
+                        </div>
+                    `;
+                }
+                return '';
+            }).join('');
 
-      <div className="bg-white shadow-xl rounded-2xl p-6">
+            const teamHeaderHtml = TEAMS.map(team => `
+                <th key="${team}" class="px-4 py-3 text-center text-xs font-medium text-white uppercase tracking-wider">${team}</th>
+            `).join('');
 
-        <h2 className="text-2xl font-extrabold mb-4" style={{ color: LEAP_COLORS.BLUE }}><Zap className="inline h-6 w-6 mb-1 mr-2" />Pillar Radar Data</h2>
+            const scoreInputHtml = teamData.behaviorScores.map((item, index) => {
+                const rowClass = index % 3 === 0 ? `border-t-2 border-dashed` : '';
+                return `
+                    <tr key="${index}" class="hover:bg-blue-50 transition ${rowClass}" style="border-color: ${LEAP_COLORS.BLUE};">
+                        <td class="px-6 py-3 whitespace-nowrap font-semibold ${index % 3 === 0 ? 'text-gray-900' : 'text-gray-500'}">
+                            ${item.pillar}
+                        </td>
+                        <td class="px-6 py-3 whitespace-nowrap text-sm text-gray-700">
+                            ${item.behavior}
+                        </td>
+                        ${TEAMS.map(team => {
+                            const teamScores = allTeamData[team]?.behaviorScores || initialTeamData(team).behaviorScores;
+                            const score = teamScores.find(scoreItem => 
+                                scoreItem.pillar === item.pillar && scoreItem.behavior === item.behavior
+                            )?.score || 3;
+                            const isEditableForTeam = team === userTeam && isEditable;
+                            
+                            return `
+                                <td key="${team}" class="px-4 py-2 whitespace-nowrap text-sm text-center">
+                                    <select
+                                        value="${score}"
+                                        onchange="window.app.handleScoreChange('${team}', ${index}, parseInt(this.value, 10))"
+                                        class="w-16 p-1 text-center border-2 rounded-lg cursor-pointer bg-white text-gray-800 focus:ring-4 transition ${!isEditableForTeam ? 'opacity-50 cursor-not-allowed bg-gray-100' : 'focus:ring-blue-300'}"
+                                        style="border-color: ${isEditableForTeam ? LEAP_COLORS.BLUE : '#ccc'};"
+                                        ${!isEditableForTeam ? 'disabled' : ''}
+                                    >
+                                        ${[1, 2, 3, 4, 5].map(val => `<option value="${val}">${val}</option>`).join('')}
+                                    </select>
+                                </td>
+                            `;
+                        }).join('')}
+                    </tr>
+                `;
+            }).join('');
 
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
 
-          {leaderboard.map(team => (
+            container.innerHTML = `
+                <div class="p-4">
+                    <h2 class="text-2xl font-extrabold mb-6" style="color: ${LEAP_COLORS.BLUE};">
+                        <i data-lucide="cpu" class="h-6 w-6 mb-1 mr-2 inline"></i>Behavior Scores (1–5) by Pillar and Team
+                    </h2>
 
-            <div key={team.team} className="p-4 border border-gray-200 rounded-xl shadow-inner">
+                    ${userTeam ? llmButtons : `
+                        <div class="bg-gray-200 border border-gray-400 text-gray-700 px-4 py-3 rounded-xl mb-4 text-center font-semibold">
+                            You must claim a team to edit scores and generate improvement plans.
+                        </div>
+                    `}
 
-              <h4 className="text-lg font-bold mb-3" style={{ color: LEAP_COLORS.GREY }}>{team.team} Averages</h4>
+                    ${llmStatus.error ? `<div class="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded-xl mb-4">${llmStatus.error}</div>` : ''}
+                    ${llmStatus.message && !llmStatus.error ? `<div class="bg-green-100 border border-green-400 text-green-700 px-4 py-3 rounded-xl mb-4">${llmStatus.message}</div>` : ''}
 
-              {Object.entries(team.radar).map(([pillar, avg]) => (
+                    <div class="overflow-x-auto bg-white rounded-2xl shadow-xl">
+                        <table class="min-w-full divide-y divide-gray-200">
+                            <thead class="sticky top-0 shadow-sm" style="background-color: ${LEAP_COLORS.BLUE};">
+                                <tr>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-white uppercase tracking-wider">Pillar</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-white uppercase tracking-wider">Behavior</th>
+                                    ${teamHeaderHtml}
+                                </tr>
+                            </thead>
+                            <tbody class="bg-white divide-y divide-gray-100">
+                                ${scoreInputHtml}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            `;
+            lucide.createIcons();
+        };
 
-                <div key={pillar} className="mb-2">
+        const renderSettings = () => {
+            const container = document.getElementById('settings-content');
+            if (!container) return;
 
-                  <p className="text-sm font-medium">{pillar} Excellence:</p>
+            const isEditable = getIsTrainer();
+            const currentTotal = PILLARS.reduce((sum, p) => sum + (weights[p] || 0), 0);
+            const isTotalValid = Math.abs(currentTotal - 1.0) < 0.001;
+            const totalColor = isTotalValid ? 'text-green-600' : 'text-red-600';
 
-                  <div className="flex items-center space-x-2">
+            const weightsHtml = PILLARS.map(pillar => `
+                <div key="${pillar}" class="flex justify-between items-center py-3 border-b border-gray-100">
+                    <span class="text-lg font-medium text-gray-700">${pillar}</span>
+                    <input
+                        type="number"
+                        min="0"
+                        max="1"
+                        step="0.05"
+                        value="${weights[pillar]}"
+                        onchange="window.app.handleWeightChange('${pillar}', parseFloat(this.value) || 0)"
+                        class="w-24 p-2 border-2 rounded-lg text-center font-mono focus:ring-4 transition ${!isEditable ? 'bg-gray-100 opacity-70 cursor-not-allowed' : ''}"
+                        style="border-color: ${LEAP_COLORS.BLUE};"
+                        ${!isEditable ? 'disabled' : ''}
+                    />
+                </div>
+            `).join('');
 
-                    <div className="flex-grow bg-gray-100 rounded-full h-2.5">
+            container.innerHTML = `
+                <div class="p-4 space-y-6">
+                    <h2 class="text-2xl font-extrabold mb-4" style="color: ${LEAP_COLORS.BLUE};">
+                        <i data-lucide="layers" class="h-6 w-6 mb-1 mr-2 inline"></i>Pillar Weights (must total 1.00)
+                    </h2>
+                    
+                    ${!isEditable ? `
+                        <div class="bg-gray-200 border border-gray-400 text-gray-700 px-4 py-3 rounded-xl text-center font-semibold">
+                            Only the Trainer role can edit Pillar Weights.
+                        </div>
+                    ` : ''}
 
-                      <div
+                    <div class="bg-white shadow-xl rounded-2xl p-6 max-w-lg mx-auto">
+                        <div class="flex justify-between items-center mb-4 pb-2 border-b-2" style="border-color: ${LEAP_COLORS.BLUE};">
+                            <span class="font-bold text-lg text-gray-800">Pillar</span>
+                            <span class="font-bold text-lg text-gray-800">Weight</span>
+                        </div>
+                        ${weightsHtml}
+                        <div class="mt-6 pt-4 border-t-2 flex justify-between items-center">
+                            <span class="font-bold text-xl text-gray-800">Total:</span>
+                            <span class="font-extrabold text-2xl ${totalColor}">${currentTotal.toFixed(2)}</span>
+                        </div>
+                        <p class="mt-4 text-sm italic" style="color: ${LEAP_COLORS.GREY};">Adjust the weights to change the scoring model. Total must be 1.00 for accurate scores.</p>
+                    </div>
+                </div>
+            `;
+            lucide.createIcons();
+        };
 
-                        className="h-2.5 rounded-full transition-all duration-500"
+        const renderAllianceLedger = () => {
+            const container = document.getElementById('ledger-content');
+            if (!container) return;
+            
+            const tableRows = ledgerItems.map(item => `
+                <tr class="hover:bg-blue-50 transition">
+                    ${['area', 'action', 'owner', 'kpi', 'timeline', 'proof'].map(field => `
+                        <td class="px-4 py-3 text-sm text-gray-700">
+                            <input
+                                type="text"
+                                value="${item[field] || ''}"
+                                onchange="window.app.handleLedgerEdit('${item.id}', '${field}', this.value)"
+                                class="w-full p-1 border-b border-gray-300 focus:border-blue-500 bg-transparent text-sm"
+                            />
+                        </td>
+                    `).join('')}
+                    <td class="px-4 py-3 text-sm text-center">
+                        <button
+                            onclick="window.app.handleLedgerDelete('${item.id}')"
+                            class="text-red-600 hover:text-red-800 transition p-1 rounded-full hover:bg-red-100"
+                            title="Delete Commitment"
+                        >
+                            <i data-lucide="trash-2" class="h-4 w-4"></i>
+                        </button>
+                    </td>
+                </tr>
+            `).join('');
 
-                        style={{
-
-                          width: `${(avg / 5) * 100}%`, // Max score is 5
-
-                          backgroundColor: LEAP_COLORS.BLUE
-
-                        }}
-
-                      ></div>
-
+            container.innerHTML = `
+                <div class="p-4">
+                    <div class="flex justify-between items-center mb-6">
+                        <h2 class="text-2xl font-extrabold" style="color: ${LEAP_COLORS.BLUE};">
+                            <i data-lucide="trending-up" class="h-6 w-6 mb-1 mr-2 inline"></i>Alliance Ledger (30-day Commitments)
+                        </h2>
+                        <button
+                            onclick="window.app.handleLedgerAdd()"
+                            class="flex items-center px-4 py-2 text-sm font-semibold rounded-lg text-white transition duration-300 shadow-md hover:shadow-lg"
+                            style="background-color: ${LEAP_COLORS.BLUE};"
+                        >
+                            <i data-lucide="plus-circle" class="h-5 w-5 mr-2"></i>
+                            Add New Commitment
+                        </button>
                     </div>
 
-                    <span className="text-xs font-semibold" style={{ color: LEAP_COLORS.BLUE }}>{avg.toFixed(2)}</span>
-
-                  </div>
-
+                    <div class="overflow-x-auto bg-white rounded-2xl shadow-xl">
+                        <table class="min-w-full divide-y divide-gray-200">
+                            <thead class="sticky top-0 shadow-sm" style="background-color: ${LEAP_COLORS.BLUE};">
+                                <tr>
+                                    ${['Area', 'Action', 'Owner', 'KPI', 'Timeline', 'Proof', 'Actions'].map(header => `
+                                        <th key="${header}" class="px-4 py-3 text-left text-xs font-medium text-white uppercase tracking-wider">
+                                            ${header}
+                                        </th>
+                                    `).join('')}
+                                </tr>
+                            </thead>
+                            <tbody class="bg-white divide-y divide-gray-100">
+                                ${tableRows}
+                            </tbody>
+                        </table>
+                        ${ledgerItems.length === 0 ? '<p class="p-6 text-center text-gray-500 italic">No commitments recorded. Click "Add New Commitment" to start tracking!</p>' : ''}
+                    </div>
+                    <p class="p-4 text-sm italic" style="color: ${LEAP_COLORS.GREY};">
+                        This ledger tracks team commitments to improve pillar scores. Edit fields directly to update records.
+                    </p>
                 </div>
+            `;
+            lucide.createIcons();
+        };
 
-              ))}
+        const renderApp = () => {
+            renderUserStatus();
+            renderTeamSelectionModal();
 
-            </div>
+            if (!userRole) return;
 
-          ))}
+            const container = document.getElementById('main-content');
+            if (!container) return;
 
-        </div>
+            // Render navigation tabs
+            const navItems = [
+                { name: 'Leaderboard', id: 'leaderboard-content', icon: 'award' },
+                { name: 'Behaviors', id: 'behaviors-content', icon: 'cpu' },
+                { name: 'Settings', id: 'settings-content', icon: 'layers' },
+                { name: 'Alliance Ledger', id: 'ledger-content', icon: 'trending-up' },
+            ];
 
-      </div>
-
-    </div>
-
-  );
-
- 
-
-  const renderBehaviors = () => (
-
-    <div className="p-4">
-
-      <h2 className="text-2xl font-extrabold mb-6" style={{ color: LEAP_COLORS.BLUE }}><Users className="inline h-6 w-6 mb-1 mr-2" />Behavior Scores (1–5) by Pillar and Team</h2>
-
-      {!userRole && (
-
-        <div className="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded-xl mb-4 text-center font-semibold">
-
-          You must select a role on the startup screen to view or edit scores.
-
-        </div>
-
-      )}
-
-     
-
-      {/* LLM Status and Action Plan Buttons */}
-
-      {userTeam && ( // Only show LLM for team members
-
-        <div className="bg-white shadow-xl rounded-2xl p-6 mb-6 space-y-4">
-
-          <h3 className="text-xl font-bold" style={{ color: LEAP_COLORS.RED }}>
-
-            AI-Powered Improvement Coach
-
-          </h3>
-
-          {llmStatus.isLoading && (
-
-            <div className="flex items-center space-x-3 text-lg font-semibold text-orange-600">
-
-              <svg className="animate-spin h-5 w-5 text-orange-600" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
-
-              Generating plan for {llmStatus.targetPillar}...
-
-            </div>
-
-          )}
-
-          {llmStatus.error && (
-
-             <div className="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded-lg">{llmStatus.error}</div>
-
-          )}
-
-          {llmStatus.message && (
-
-             <div className="bg-green-100 border border-green-400 text-green-700 px-4 py-3 rounded-lg">{llmStatus.message}</div>
-
-          )}
-
-         
-
-          <div className="flex flex-wrap gap-3">
-
-            {PILLARS.map(pillar => {
-
-              const avg = currentUserPillarAverages[pillar] || 0;
-
-              const isLow = avg < LOW_SCORE_THRESHOLD && avg > 0;
-
-              const isProcessing = llmStatus.isLoading && llmStatus.targetPillar === pillar;
-
- 
-
-              return (
-
+            const navHtml = navItems.map(item => `
                 <button
-
-                  key={pillar}
-
-                  onClick={() => generateActionPlan(pillar, currentTeamData.behaviorScores)}
-
-                  className={`flex items-center px-4 py-2 text-sm font-semibold rounded-lg transition duration-300 shadow-md ${
-
-                    isLow
-
-                      ? 'bg-red-500 text-white hover:bg-red-600'
-
-                      : 'bg-gray-200 text-gray-500 cursor-not-allowed'
-
-                  }`}
-
-                  disabled={!isLow || llmStatus.isLoading}
-
+                    onclick="window.app.setActiveTab('${item.name}')"
+                    class="flex items-center px-3 py-2 text-sm font-medium rounded-t-lg transition-all duration-300 tab-button ${
+                        activeTab === item.name
+                          ? 'shadow-lg border-b-4 text-gray-900 bg-gray-100'
+                          : 'text-gray-500 hover:text-gray-900 hover:bg-gray-50'
+                    }"
+                    style="${activeTab === item.name ? `border-color: ${LEAP_COLORS.BLUE};` : ''}"
                 >
-
-                  <Sparkles className="h-4 w-4 mr-2" />
-
-                  {isProcessing ? 'Generating...' : `Plan for ${pillar} (${avg.toFixed(2)}/5)`}
-
+                    <i data-lucide="${item.icon}" class="h-5 w-5 mr-1 sm:mr-2"></i>
+                    ${item.name}
                 </button>
+            `).join('');
 
-              );
+            document.getElementById('nav-tabs').innerHTML = navHtml;
+            
+            // Hide all content areas
+            navItems.forEach(item => {
+                const element = document.getElementById(item.id);
+                if (element) element.classList.add('hidden');
+            });
 
-            })}
+            // Show active content area
+            const activeElement = document.getElementById(navItems.find(item => item.name === activeTab)?.id);
+            if (activeElement) {
+                activeElement.classList.remove('hidden');
+            }
 
-          </div>
+            // Render content for the active tab
+            switch (activeTab) {
+                case 'Leaderboard': return renderLeaderboard();
+                case 'Behaviors': return renderBehaviors();
+                case 'Settings': return renderSettings();
+                case 'Alliance Ledger': return renderAllianceLedger();
+            }
+            lucide.createIcons();
+        };
 
-          <p className="text-xs italic text-gray-500">
+        // --- FIREBASE INITIALIZATION AND LISTENERS ---
 
-            A button turns red when your team's score in that pillar drops below **{LOW_SCORE_THRESHOLD}**. Click it to auto-generate a 3-point action plan for improvement using the Gemini LLM.
+        const seedInitialData = async () => {
+            if (!db) return;
+            try {
+                // 1. Weights
+                const configRef = doc(db, `${PUBLIC_DATA_PATH}/scoreboard_config`, 'weights');
+                const docSnap = await getDoc(configRef);
+                if (!docSnap.exists()) {
+                    await setDoc(configRef, { weights: initialWeights });
+                }
 
-          </p>
+                // 2. Team Inputs
+                const teamCollectionRef = collection(db, `${PUBLIC_DATA_PATH}/team_inputs`);
+                const teamSnap = await getDocs(teamCollectionRef);
+                if (teamSnap.empty) {
+                    TEAMS.forEach(async (team) => {
+                        await setDoc(doc(teamCollectionRef, team), initialTeamData(team));
+                    });
+                }
+            } catch (error) {
+                console.error("Error seeding initial data:", error);
+            }
+        };
 
+        const subscribeToData = () => {
+            if (!db || !isAuthReady) return () => {};
+
+            // 1. Subscribe to User Role (Private Data)
+            const userRoleRef = doc(db, PRIVATE_DATA_PATH(userId), 'role_claim');
+            const unsubscribeRole = onSnapshot(userRoleRef, (docSnap) => {
+                if (docSnap.exists() && docSnap.data().role) {
+                    userRole = docSnap.data().role;
+                }
+                renderApp();
+            });
+
+            // 2. Subscribe to Weights (Public Data)
+            const configRef = doc(db, `${PUBLIC_DATA_PATH}/scoreboard_config`, 'weights');
+            const unsubscribeWeights = onSnapshot(configRef, (docSnap) => {
+                if (docSnap.exists()) {
+                    weights = docSnap.data().weights;
+                }
+                renderApp();
+            });
+
+            // 3. Subscribe to All Team Data (Public Data)
+            const teamCollectionRef = collection(db, `${PUBLIC_DATA_PATH}/team_inputs`);
+            const unsubscribeTeams = onSnapshot(teamCollectionRef, (snapshot) => {
+                const teamDataMap = {};
+                snapshot.docs.forEach(doc => {
+                    teamDataMap[doc.id] = doc.data();
+                });
+                allTeamData = teamDataMap;
+                renderApp();
+            });
+
+            // 4. Subscribe to Alliance Ledger (Public Data)
+            const ledgerCollectionRef = collection(db, `${PUBLIC_DATA_PATH}/alliance_ledger`);
+            const unsubscribeLedger = onSnapshot(ledgerCollectionRef, (snapshot) => {
+                ledgerItems = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                ledgerItems.sort((a, b) => (a.id > b.id) ? 1 : -1); // Sort by ID (creation time)
+                renderApp();
+            });
+
+            return () => {
+                unsubscribeRole();
+                unsubscribeWeights();
+                unsubscribeTeams();
+                unsubscribeLedger();
+            };
+        };
+
+        const initializeFirebase = async () => {
+            if (!__firebase_config) {
+                console.error("Firebase config is missing.");
+                return;
+            }
+
+            try {
+                setLogLevel('debug');
+                const app = initializeApp(__firebase_config);
+                db = getFirestore(app);
+                auth = getAuth(app);
+                
+                // CRITICAL FIX: setPersistence must be called with a persistence type
+                await setPersistence(auth, browserLocalPersistence); 
+
+                onAuthStateChanged(auth, async (user) => {
+                    if (!user) {
+                        try {
+                            if (__initial_auth_token) {
+                                await signInWithCustomToken(auth, __initial_auth_token);
+                            } else {
+                                await signInAnonymously(auth);
+                            }
+                        } catch (e) {
+                            console.error("Auth sign in failed:", e);
+                        }
+                    }
+                    userId = auth.currentUser?.uid || generateUniqueId();
+                    isAuthReady = true;
+
+                    // Data seeding runs once after auth is ready
+                    await seedInitialData();
+
+                    // Listeners start after auth is ready
+                    subscribeToData();
+                    renderApp();
+                });
+
+            } catch (error) {
+                console.error("Firebase initialization failed:", error);
+            }
+        };
+
+        // --- PUBLIC API FOR WINDOW (Event handlers) ---
+
+        window.app = {
+            handleScoreChange,
+            handleWeightChange,
+            handleEvidenceFactorChange,
+            handleLedgerEdit,
+            handleLedgerAdd: (area, action, kpi, timeline) => handleLedgerAdd(area, action, kpi, timeline),
+            handleLedgerDelete,
+            handleTeamClaim,
+            setActiveTab: (tab) => {
+                activeTab = tab;
+                renderApp();
+            },
+            // Wrapper to expose LLM function to onclick handler
+            generateImprovementPlanWrapper: (pillar, lowScoresString) => {
+                try {
+                    const lowScores = JSON.parse(lowScoresString);
+                    generateImprovementPlan(pillar, lowScores);
+                } catch (e) {
+                    console.error("Error parsing low scores:", e);
+                    llmStatus = { isLoading: false, error: "Data error: Cannot generate plan.", targetPillar: pillar };
+                    renderApp();
+                }
+            }
+        };
+
+        // --- Start Application ---
+        document.addEventListener('DOMContentLoaded', initializeFirebase);
+    </script>
+</head>
+<body class="bg-gray-50 min-h-screen">
+
+    <!-- Team Selection Modal -->
+    <div id="team-selection-modal" class="fixed inset-0 bg-gray-900 bg-opacity-75 flex items-center justify-center z-50 p-4 hidden">
+        <div class="bg-white rounded-2xl shadow-2xl p-8 max-w-md w-full text-center">
+            <i data-lucide="log-in" class="h-10 w-10 mx-auto mb-4" style="color: ${LEAP_COLORS.BLUE};"></i>
+            <h2 class="text-2xl font-bold mb-3" style="color: ${LEAP_COLORS.BLUE};">Welcome to the Scoreboard!</h2>
+            <p class="text-gray-700 mb-6">Please select your role to begin.</p>
+            
+            <div class="mb-4">
+                <label for="team-list" class="block text-left text-sm font-medium text-gray-700 mb-1">Select your team:</label>
+                <select id="team-list" class="w-full p-3 border-2 rounded-lg text-lg focus:ring-4 transition" style="border-color: ${LEAP_COLORS.BLUE};"></select>
+            </div>
+            
+            <button id="select-team-button" class="w-full py-3 text-lg font-semibold rounded-lg text-white transition duration-300 shadow-md hover:shadow-lg mb-3" style="background-color: ${LEAP_COLORS.BLUE};">
+                <i data-lucide="check-circle" class="inline h-5 w-5 mr-2 mb-1"></i>
+                Claim Team Role
+            </button>
+
+            <button id="login-trainer-button" class="w-full py-3 text-lg font-semibold rounded-lg text-gray-700 border-2 transition duration-300 shadow-sm hover:shadow-md" style="border-color: ${LEAP_COLORS.GREY};">
+                <i data-lucide="users" class="inline h-5 w-5 mr-2 mb-1"></i>
+                Login as Trainer (Read-Only)
+            </button>
         </div>
-
-      )}
-
- 
-
-      {/* Scoreboard Table */}
-
-      <div className="overflow-x-auto bg-white rounded-2xl shadow-xl">
-
-        <table className="min-w-full divide-y divide-gray-200">
-
-          <thead className="sticky top-0 shadow-sm" style={{ backgroundColor: LEAP_COLORS.BLUE }}>
-
-            <tr>
-
-              <th className="px-6 py-3 text-left text-xs font-medium text-white uppercase tracking-wider">Pillar</th>
-
-              <th className="px-6 py-3 text-left text-xs font-medium text-white uppercase tracking-wider">Behavior</th>
-
-              {TEAMS.map(team => (
-
-                <th key={team} className="px-4 py-3 text-center text-xs font-medium text-white uppercase tracking-wider">{team}</th>
-
-              ))}
-
-            </tr>
-
-          </thead>
-
-          <tbody className="bg-white divide-y divide-gray-100">
-
-            {currentTeamData.behaviorScores.map((item, index) => (
-
-              <tr key={index} className="hover:bg-blue-50 transition">
-
-                <td className={`px-6 py-3 whitespace-nowrap font-semibold ${index % 3 === 0 ? 'border-t-2' : ''}`} style={{ borderColor: LEAP_COLORS.BLUE }}>
-
-                  {item.pillar}
-
-                </td>
-
-                <td className="px-6 py-3 whitespace-nowrap text-sm text-gray-700">
-
-                  {item.behavior}
-
-                </td>
-
-                {TEAMS.map(team => {
-
-                    // Find the score for this specific team (docId) and this specific behavior
-
-                    const teamScores = allTeamData[team]?.behaviorScores || initialScoresTemplate;
-
-                    const score = teamScores.find(scoreItem =>
-
-                        scoreItem.pillar === item.pillar && scoreItem.behavior === item.behavior
-
-                    )?.score || 3;
-
-                   
-
-                    const isEditable = team === userTeam && !isTrainer;
-
-                   
-
-                    return (
-
-                        <td key={team} className="px-4 py-2 whitespace-nowrap text-sm text-center">
-
-                            <ScoreInput
-
-                                score={score}
-
-                                onChange={(newScore) => handleScoreChange(team, index, newScore)}
-
-                                disabled={!isEditable}
-
-                            />
-
-                        </td>
-
-                    );
-
-                })}
-
-              </tr>
-
-            ))}
-
-          </tbody>
-
-        </table>
-
-      </div>
-
     </div>
 
-  );
+    <!-- Header -->
+    <header class="py-4 shadow-lg" style="background-color: ${LEAP_COLORS.BLUE};">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex flex-col sm:flex-row justify-between items-center">
+            <h1 class="text-2xl sm:text-3xl font-extrabold tracking-tight text-white mb-3 sm:mb-0">
+                Strategic Alliance Scoreboard
+            </h1>
+            <div id="user-status"></div>
+        </div>
+    </header>
 
- 
-
-  const renderSettings = () => {
-
-    const currentTotal = PILLARS.reduce((sum, p) => sum + (weights[p] || 0), 0);
-
-    const isTotalValid = Math.abs(currentTotal - 1.0) < 0.001;
-
-    const totalColor = isTotalValid ? 'text-green-600' : 'text-red-600';
-
- 
-
-    return (
-
-      <div className="p-4 space-y-6">
-
-        <h2 className="text-2xl font-extrabold mb-4" style={{ color: LEAP_COLORS.BLUE }}><Layers className="inline h-6 w-6 mb-1 mr-2" />Pillar Weights (must total 1.00)</h2>
-
-        {isTrainer && (
-
-            <div className="bg-yellow-100 border border-yellow-400 text-yellow-700 px-4 py-3 rounded-xl text-center font-semibold">
-
-              You are logged in as Trainer (Read-Only). Weights cannot be edited.
-
+    <!-- Navigation Tabs -->
+    <nav class="shadow-md bg-white">
+        <div class="max-w-7xl mx-auto px-2 sm:px-6 lg:px-8">
+            <div id="nav-tabs" class="flex justify-start space-x-1 sm:space-x-4">
+                <!-- Tabs rendered here by renderApp -->
             </div>
-
-        )}
-
-        <div className="bg-white shadow-xl rounded-2xl p-6 max-w-lg mx-auto">
-
-          <div className="flex justify-between items-center mb-4 pb-2 border-b-2" style={{ borderColor: LEAP_COLORS.BLUE }}>
-
-            <span className="font-bold text-lg text-gray-800">Pillar</span>
-
-            <span className="font-bold text-lg text-gray-800">Weight</span>
-
-          </div>
-
-          {PILLARS.map(pillar => (
-
-            <div key={pillar} className="flex justify-between items-center py-3 border-b border-gray-100">
-
-              <span className="text-lg font-medium text-gray-700">{pillar}</span>
-
-              <input
-
-                type="number"
-
-                min="0"
-
-                max="1"
-
-                step="0.05"
-
-                value={weights[pillar]}
-
-                onChange={(e) => handleWeightChange(pillar, parseFloat(e.target.value) || 0)}
-
-                className={`w-24 p-2 border-2 rounded-lg text-center font-mono focus:ring-4 transition ${isTrainer ? 'bg-gray-100 opacity-70 cursor-not-allowed' : ''}`}
-
-                style={{ borderColor: LEAP_COLORS.BLUE }}
-
-                disabled={isTrainer}
-
-              />
-
-            </div>
-
-          ))}
-
-          <div className="mt-6 pt-4 border-t-2 flex justify-between items-center">
-
-            <span className="font-bold text-xl text-gray-800">Total:</span>
-
-            <span className={`font-extrabold text-2xl ${totalColor}`}>{currentTotal.toFixed(2)}</span>
-
-          </div>
-
-          <p className="mt-4 text-sm italic" style={{ color: LEAP_COLORS.GREY }}>Adjust the weights to change the scoring model. Total must be 1.00 for accurate scores.</p>
-
         </div>
-
-      </div>
-
-    );
-
-  };
-
- 
-
-  const renderAllianceLedger = () => (
-
-    <div className="p-4">
-
-      <div className="flex justify-between items-center mb-6">
-
-        <h2 className="text-2xl font-extrabold" style={{ color: LEAP_COLORS.BLUE }}>
-
-          <TrendingUp className="inline h-6 w-6 mb-1 mr-2" />Alliance Ledger (30-day Commitments)
-
-        </h2>
-
-        <button
-
-          onClick={handleLedgerAdd}
-
-          className="flex items-center px-4 py-2 text-sm font-semibold rounded-lg text-white transition duration-300 shadow-md hover:shadow-lg"
-
-          style={{ backgroundColor: LEAP_COLORS.BLUE }}
-
-        >
-
-          <PlusCircle className="h-5 w-5 mr-2" />
-
-          Add New Commitment
-
-        </button>
-
-      </div>
-
- 
-
-      <div className="overflow-x-auto bg-white rounded-2xl shadow-xl">
-
-        <table className="min-w-full divide-y divide-gray-200">
-
-          <thead className="sticky top-0 shadow-sm" style={{ backgroundColor: LEAP_COLORS.BLUE }}>
-
-            <tr>
-
-              {['Area', 'Action', 'Owner', 'KPI', 'Timeline', 'Proof', 'Actions'].map(header => (
-
-                <th key={header} className="px-4 py-3 text-left text-xs font-medium text-white uppercase tracking-wider">
-
-                  {header}
-
-                </th>
-
-              ))}
-
-            </tr>
-
-          </thead>
-
-          <tbody className="bg-white divide-y divide-gray-100">
-
-            {ledgerItems.map(item => (
-
-              <LedgerRow
-
-                key={item.id}
-
-                item={item}
-
-                onEdit={handleLedgerEdit}
-
-                onDelete={handleLedgerDelete}
-
-              />
-
-            ))}
-
-          </tbody>
-
-        </table>
-
-        {ledgerItems.length === 0 && (
-
-          <p className="p-6 text-center text-gray-500 italic">No commitments recorded. Click "Add New Commitment" to start tracking!</p>
-
-        )}
-
-      </div>
-
-      <p className="p-4 text-sm italic" style={{ color: LEAP_COLORS.GREY }}>
-
-        This ledger tracks team commitments to improve pillar scores. Edit fields directly to update records.
-
-      </p>
-
-    </div>
-
-  );
-
- 
-
-  // --- MAIN APP STRUCTURE ---
-
-  const renderView = () => {
-
-    // Show loading or team selection until ready
-
-    if (!isAuthReady) {
-
-        return <div className="p-10 text-center text-gray-500">Connecting to Firebase...</div>;
-
-    }
-
-    if (!userRole) {
-
-        return <TeamSelectionModal teams={TEAMS} onSelect={handleRoleClaim} />;
-
-    }
-
- 
-
-    // Main navigation and view rendering
-
-    switch (activeTab) {
-
-      case 'Settings': return renderSettings();
-
-      case 'Behaviors': return renderBehaviors();
-
-      case 'Alliance Ledger': return renderAllianceLedger();
-
-      case 'Leaderboard':
-
-      default: return renderLeaderboard();
-
-    }
-
-  };
-
- 
-
-  const navItems = [
-
-    { name: 'Leaderboard', icon: Award },
-
-    { name: 'Behaviors', icon: Cpu },
-
-    { name: 'Settings', icon: Layers },
-
-    { name: 'Alliance Ledger', icon: TrendingUp },
-
-  ];
-
- 
-
-  return (
-
-    <div className="min-h-screen bg-gray-50 font-sans">
-
-      {/* Header */}
-
-      <header className="py-4 shadow-lg" style={{ backgroundColor: LEAP_COLORS.BLUE }}>
-
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex flex-col sm:flex-row justify-between items-center">
-
-          <h1 className="text-2xl sm:text-3xl font-extrabold tracking-tight text-white mb-3 sm:mb-0">
-
-            Strategic Alliance Scoreboard
-
-          </h1>
-
+    </nav>
+
+    <!-- Main Content -->
+    <main class="max-w-7xl mx-auto py-6 sm:px-6 lg:px-8">
+        <div id="main-content" class="px-4 sm:px-0">
+            <!-- Content for active tab -->
+            <div id="leaderboard-content" class="tab-content"></div>
+            <div id="behaviors-content" class="tab-content hidden"></div>
+            <div id="settings-content" class="tab-content hidden"></div>
+            <div id="ledger-content" class="tab-content hidden"></div>
         </div>
+    </main>
 
-      </header>
-
- 
-
-      {/* Navigation Tabs */}
-
-      <nav className="shadow-md bg-white">
-
-        <div className="max-w-7xl mx-auto px-2 sm:px-6 lg:px-8">
-
-          <div className="flex justify-start space-x-1 sm:space-x-4">
-
-            {navItems.map((item) => {
-
-              const Icon = item.icon;
-
-              const isActive = activeTab === item.name;
-
-              return (
-
-                <button
-
-                  key={item.name}
-
-                  onClick={() => setActiveTab(item.name)}
-
-                  className={`flex items-center px-3 py-2 text-sm font-medium rounded-t-lg transition-all duration-300 ${
-
-                    isActive
-
-                      ? 'shadow-lg border-b-4 border-blue-500 text-gray-900 bg-gray-100'
-
-                      : 'text-gray-500 hover:text-gray-900 hover:bg-gray-50'
-
-                  }`}
-
-                  style={isActive ? { borderColor: LEAP_COLORS.BLUE } : {}}
-
-                >
-
-                  <Icon className="h-5 w-5 mr-1 sm:mr-2" />
-
-                  {item.name}
-
-                </button>
-
-              );
-
-            })}
-
-          </div>
-
-        </div>
-
-      </nav>
-
- 
-
-      {/* Main Content */}
-
-      <main className="max-w-7xl mx-auto py-6 sm:px-6 lg:px-8">
-
-        <div className="px-4 sm:px-0">
-
-          {renderView()}
-
-        </div>
-
-      </main>
-
- 
-
-      {/* Footer */}
-
-      <footer className="w-full py-3 mt-10 text-center" style={{ backgroundColor: '#F3F4F6' }}>
-
-        <p className="text-sm italic" style={{ color: LEAP_COLORS.GREY }}>
-
-          LeapToSuccess | Transforming Talent into Performance
-
+    <!-- Footer -->
+    <footer class="w-full py-3 mt-10 text-center" style="background-color: #F3F4F6;">
+        <p class="text-sm italic" style="color: ${LEAP_COLORS.GREY};">
+            LeapToSuccess | Transforming Talent into Performance
         </p>
+    </footer>
 
-      </footer>
-
- 
-
-      {/* Team Selection Modal rendered outside main content if userRole is not set */}
-
-      {!userRole && isAuthReady && <TeamSelectionModal teams={TEAMS} onSelect={handleRoleClaim} />}
-
-    </div>
-
-  );
-
-};
-
- 
-
-export default App;
+</body>
+</html>
