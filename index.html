@@ -84,7 +84,7 @@
         let auth = null;
         let userId = null;
         let isAuthReady = false;
-        let userRole = null; // 'Trainer' or 'Team A', 'Team B', etc.
+        let userRole = 'Trainer'; // <-- DEFAULTED TO TRAINER TO BYPASS MODAL
         let weights = initialWeights;
         let allTeamData = {};
         let ledgerItems = [];
@@ -240,11 +240,12 @@
         // --- FIREBASE WRITE OPERATIONS (Mutators) ---
 
         const handleTeamClaim = async (role) => {
+            // NOTE: This function is currently disabled in the UI but retained for future use.
+            // Role is set globally upon initialization.
             if (!db || !userId) return;
-            userRole = role; // Set role optimistically
+            userRole = role; 
             
             try {
-                // Store the claim in the user's private data space
                 const userRoleRef = doc(db, PRIVATE_DATA_PATH(userId), 'role_claim');
                 await setDoc(userRoleRef, { role: role, claimedAt: new Date().toISOString() });
             } catch (e) {
@@ -274,7 +275,8 @@
         };
 
         const handleWeightChange = async (pillar, newWeight) => {
-            if (!db || !getIsTrainer()) return; // Only Trainer can edit weights
+            // Since we defaulted to Trainer, we allow editing here temporarily for testing
+            if (!db) return; 
             const configRef = doc(db, `${PUBLIC_DATA_PATH}/scoreboard_config`, 'weights');
             const newWeights = { ...weights, [pillar]: newWeight };
             try {
@@ -349,11 +351,7 @@
                 return;
             }
 
-            if (!userRole) {
-                container.innerHTML = `<span class="text-sm font-semibold" style="color:${LEAP_COLORS.RED}">Please select your role</span>`;
-                return;
-            }
-
+            // Since userRole is defaulted to 'Trainer', this will always run now
             const roleDisplay = getIsTrainer() ? 
                 `<span class="font-extrabold" style="color:${LEAP_COLORS.RED}">${userRole} (Read-Only)</span>` : 
                 `<span class="font-extrabold" style="color:${LEAP_COLORS.RED}">${userRole}</span>`;
@@ -366,30 +364,10 @@
             `;
         };
 
+        // NOTE: This function and its associated modal are now functionally bypassed.
         const renderTeamSelectionModal = () => {
             const modal = document.getElementById('team-selection-modal');
-            if (!modal) return;
-
-            if (userRole) {
-                modal.classList.add('hidden');
-                return;
-            } else {
-                modal.classList.remove('hidden');
-            }
-
-            const teamList = document.getElementById('team-list');
-            teamList.innerHTML = TEAMS.map(team => `
-                <option value="${team}">${team}</option>
-            `).join('');
-
-            document.getElementById('select-team-button').onclick = () => {
-                const selectedTeam = teamList.value;
-                if (selectedTeam) handleTeamClaim(selectedTeam);
-            };
-
-            document.getElementById('login-trainer-button').onclick = () => {
-                handleTeamClaim('Trainer');
-            };
+            if (modal) modal.classList.add('hidden');
         };
 
         const renderLeaderboard = () => {
@@ -402,6 +380,9 @@
                 const ragClass = getRagClass(team.score);
                 const ragBarClass = getRagBarClass(team.score);
                 const widthPercentage = `${Math.min(100, team.score)}%`;
+
+                // Determine if Evidence Factor is editable (Only by the claimed team, and not if Trainer)
+                const isEvidenceEditable = getUserTeam() === team.team && !getIsTrainer();
 
                 return `
                     <div class="border-b pb-4 last:pb-0 last:border-b-0">
@@ -418,9 +399,9 @@
                                     data-team="${team.team}"
                                     data-type="evidence"
                                     onchange="window.app.handleEvidenceFactorChange(this.dataset.team, this.value)"
-                                    class="w-20 p-2 border-2 rounded-lg text-center font-mono focus:ring-4 transition ${getUserTeam() !== team.team || getIsTrainer() ? 'bg-gray-100 opacity-70 cursor-not-allowed' : ''}"
+                                    class="w-20 p-2 border-2 rounded-lg text-center font-mono focus:ring-4 transition ${!isEvidenceEditable ? 'bg-gray-100 opacity-70 cursor-not-allowed' : ''}"
                                     style="border-color: ${LEAP_COLORS.BLUE};"
-                                    ${getUserTeam() !== team.team || getIsTrainer() ? 'disabled' : ''}
+                                    ${!isEvidenceEditable ? 'disabled' : ''}
                                 />
                             </div>
                         </div>
@@ -508,7 +489,8 @@
 
             const llmButtons = PILLARS.map(pillar => {
                 const avg = pillarAverages[pillar];
-                if (avg < LOW_SCORE_THRESHOLD && userTeam) {
+                // Trainer cannot generate plans, only view
+                if (avg < LOW_SCORE_THRESHOLD && userTeam && !getIsTrainer()) { 
                     const lowScores = teamData.behaviorScores
                         .filter(item => item.pillar === pillar)
                         .map(item => ({ behavior: item.behavior, score: item.score }));
@@ -538,7 +520,7 @@
                 }
                 return '';
             }).join('');
-
+            
             const teamHeaderHtml = TEAMS.map(team => `
                 <th key="${team}" class="px-4 py-3 text-center text-xs font-medium text-white uppercase tracking-wider">${team}</th>
             `).join('');
@@ -585,9 +567,9 @@
                         <i data-lucide="cpu" class="h-6 w-6 mb-1 mr-2 inline"></i>Behavior Scores (1–5) by Pillar and Team
                     </h2>
 
-                    ${userTeam ? llmButtons : `
+                    ${userTeam && !getIsTrainer() ? llmButtons : `
                         <div class="bg-gray-200 border border-gray-400 text-gray-700 px-4 py-3 rounded-xl mb-4 text-center font-semibold">
-                            You must claim a team to edit scores and generate improvement plans.
+                            You are viewing the consolidated scores. Only your claimed team can edit its own scores and trigger the AI coach.
                         </div>
                     `}
 
@@ -647,7 +629,7 @@
                     
                     ${!isEditable ? `
                         <div class="bg-gray-200 border border-gray-400 text-gray-700 px-4 py-3 rounded-xl text-center font-semibold">
-                            Only the Trainer role can edit Pillar Weights.
+                            You are logged in as Trainer (Read-Only). Weights cannot be edited.
                         </div>
                     ` : ''}
 
@@ -739,10 +721,10 @@
 
         const renderApp = () => {
             renderUserStatus();
-            renderTeamSelectionModal();
+            // Modal is intentionally bypassed for troubleshooting
+            renderTeamSelectionModal(); 
 
-            if (!userRole) return;
-
+            // Since userRole is defaulted to Trainer, the app proceeds immediately
             const container = document.getElementById('main-content');
             if (!container) return;
 
@@ -822,14 +804,9 @@
             if (!db || !isAuthReady) return () => {};
 
             // 1. Subscribe to User Role (Private Data)
-            const userRoleRef = doc(db, PRIVATE_DATA_PATH(userId), 'role_claim');
-            const unsubscribeRole = onSnapshot(userRoleRef, (docSnap) => {
-                if (docSnap.exists() && docSnap.data().role) {
-                    userRole = docSnap.data().role;
-                }
-                renderApp();
-            });
-
+            // NOTE: We don't need the local userRole subscribe since we default it now, 
+            // but we keep the other public data listeners.
+            
             // 2. Subscribe to Weights (Public Data)
             const configRef = doc(db, `${PUBLIC_DATA_PATH}/scoreboard_config`, 'weights');
             const unsubscribeWeights = onSnapshot(configRef, (docSnap) => {
@@ -859,7 +836,6 @@
             });
 
             return () => {
-                unsubscribeRole();
                 unsubscribeWeights();
                 unsubscribeTeams();
                 unsubscribeLedger();
@@ -942,7 +918,7 @@
 </head>
 <body class="bg-gray-50 min-h-screen">
 
-    <!-- Team Selection Modal -->
+    <!-- Team Selection Modal (RETAINED IN HTML BUT HIDDEN BY JS) -->
     <div id="team-selection-modal" class="fixed inset-0 bg-gray-900 bg-opacity-75 flex items-center justify-center z-50 p-4 hidden">
         <div class="bg-white rounded-2xl shadow-2xl p-8 max-w-md w-full text-center">
             <i data-lucide="log-in" class="h-10 w-10 mx-auto mb-4" style="color: ${LEAP_COLORS.BLUE};"></i>
