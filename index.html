@@ -374,6 +374,13 @@
             const container = document.getElementById('leaderboard-content');
             if (!container) return;
             
+            // Render loading if data is pending
+            if (Object.keys(allTeamData).length === 0) {
+                 container.innerHTML = renderLoading();
+                 lucide.createIcons();
+                 return;
+            }
+            
             const { leaderboard } = calculateLeaderboardData();
 
             const leaderboardHtml = leaderboard.map(team => {
@@ -471,9 +478,17 @@
             const container = document.getElementById('behaviors-content');
             if (!container) return;
 
+            // Render loading if data is pending
+            if (Object.keys(allTeamData).length === 0) {
+                 container.innerHTML = renderLoading();
+                 lucide.createIcons();
+                 return;
+            }
+            
             const userTeam = getUserTeam();
             const isEditable = !getIsTrainer() && userTeam;
             
+            // Use initial data structure as fallback if team data isn't loaded yet
             const teamData = allTeamData[userTeam] || initialTeamData(userTeam || 'Team A');
 
             // Calculate pillar averages for LLM button logic
@@ -599,6 +614,13 @@
             const container = document.getElementById('settings-content');
             if (!container) return;
 
+            // Render loading if data is pending
+            if (Object.keys(allTeamData).length === 0) {
+                 container.innerHTML = renderLoading();
+                 lucide.createIcons();
+                 return;
+            }
+
             const isEditable = getIsTrainer();
             const currentTotal = PILLARS.reduce((sum, p) => sum + (weights[p] || 0), 0);
             const isTotalValid = Math.abs(currentTotal - 1.0) < 0.001;
@@ -654,6 +676,13 @@
             const container = document.getElementById('ledger-content');
             if (!container) return;
             
+            // Render loading if data is pending
+            if (Object.keys(allTeamData).length === 0) {
+                 container.innerHTML = renderLoading();
+                 lucide.createIcons();
+                 return;
+            }
+
             const tableRows = ledgerItems.map(item => `
                 <tr class="hover:bg-blue-50 transition">
                     ${['area', 'action', 'owner', 'kpi', 'timeline', 'proof'].map(field => `
@@ -719,15 +748,65 @@
             lucide.createIcons();
         };
 
+        const renderLoading = () => {
+             return `
+                <div class="p-10 text-center flex flex-col items-center justify-center min-h-[400px]">
+                    <svg class="animate-spin h-10 w-10 text-gray-500" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                        <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                        <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                    </svg>
+                    <p class="mt-4 text-lg font-semibold text-gray-700">Connecting to Firebase and Loading Data...</p>
+                    <p class="text-sm text-gray-500">This happens once upon first load to synchronize the scoreboard.</p>
+                </div>
+            `;
+        };
+
         const renderApp = () => {
             renderUserStatus();
             // Modal is intentionally bypassed for troubleshooting
             renderTeamSelectionModal(); 
 
-            // Since userRole is defaulted to Trainer, the app proceeds immediately
             const container = document.getElementById('main-content');
             if (!container) return;
 
+            // Check if Firebase is ready. If not, show only the connecting status (which is in the header)
+            if (!isAuthReady) {
+                 return;
+            }
+
+            // If Auth is ready but data hasn't loaded yet, render the view structure but show loading inside the content area
+            if (Object.keys(allTeamData).length === 0) {
+                // Initialize the tab structure even if content is loading
+                const navItems = [
+                    { name: 'Leaderboard', id: 'leaderboard-content', icon: 'award' },
+                    { name: 'Behaviors', id: 'behaviors-content', icon: 'cpu' },
+                    { name: 'Settings', id: 'settings-content', icon: 'layers' },
+                    { name: 'Alliance Ledger', id: 'ledger-content', icon: 'trending-up' },
+                ];
+                
+                const navHtml = navItems.map(item => `
+                    <button
+                        onclick="window.app.setActiveTab('${item.name}')"
+                        class="flex items-center px-3 py-2 text-sm font-medium rounded-t-lg transition-all duration-300 tab-button ${
+                            item.name === activeTab ? 'shadow-lg border-b-4 text-gray-900 bg-gray-100' : 'text-gray-500 hover:text-gray-900 hover:bg-gray-50'
+                        }"
+                        style="${item.name === activeTab ? `border-color: ${LEAP_COLORS.BLUE};` : ''}"
+                    >
+                        <i data-lucide="${item.icon}" class="h-5 w-5 mr-1 sm:mr-2"></i>
+                        ${item.name}
+                    </button>
+                `).join('');
+                document.getElementById('nav-tabs').innerHTML = navHtml;
+                lucide.createIcons();
+
+                // Render loading in the main content area
+                container.innerHTML = renderLoading();
+                lucide.createIcons();
+                return;
+            }
+
+            // --- FULL RENDERING (Data is ready) ---
+            
             // Render navigation tabs
             const navItems = [
                 { name: 'Leaderboard', id: 'leaderboard-content', icon: 'award' },
@@ -753,25 +832,18 @@
 
             document.getElementById('nav-tabs').innerHTML = navHtml;
             
-            // Hide all content areas
-            navItems.forEach(item => {
-                const element = document.getElementById(item.id);
-                if (element) element.classList.add('hidden');
-            });
-
-            // Show active content area
-            const activeElement = document.getElementById(navItems.find(item => item.name === activeTab)?.id);
-            if (activeElement) {
-                activeElement.classList.remove('hidden');
-            }
-
-            // Render content for the active tab
+            // Render content for the active tab (using the fixed render functions)
+            // Note: We render directly into the main container to avoid issues with hidden divs
+            let contentHTML = '';
             switch (activeTab) {
-                case 'Leaderboard': return renderLeaderboard();
-                case 'Behaviors': return renderBehaviors();
-                case 'Settings': return renderSettings();
-                case 'Alliance Ledger': return renderAllianceLedger();
+                case 'Leaderboard': contentHTML = renderLeaderboard(); break;
+                case 'Behaviors': contentHTML = renderBehaviors(); break;
+                case 'Settings': contentHTML = renderSettings(); break;
+                case 'Alliance Ledger': contentHTML = renderAllianceLedger(); break;
+                default: contentHTML = renderLoading(); // Should not happen
             }
+            // Update the main content area
+            container.innerHTML = contentHTML;
             lucide.createIcons();
         };
 
@@ -803,11 +875,7 @@
         const subscribeToData = () => {
             if (!db || !isAuthReady) return () => {};
 
-            // 1. Subscribe to User Role (Private Data)
-            // NOTE: We don't need the local userRole subscribe since we default it now, 
-            // but we keep the other public data listeners.
-            
-            // 2. Subscribe to Weights (Public Data)
+            // 1. Subscribe to Weights (Public Data)
             const configRef = doc(db, `${PUBLIC_DATA_PATH}/scoreboard_config`, 'weights');
             const unsubscribeWeights = onSnapshot(configRef, (docSnap) => {
                 if (docSnap.exists()) {
@@ -816,7 +884,7 @@
                 renderApp();
             });
 
-            // 3. Subscribe to All Team Data (Public Data)
+            // 2. Subscribe to All Team Data (Public Data)
             const teamCollectionRef = collection(db, `${PUBLIC_DATA_PATH}/team_inputs`);
             const unsubscribeTeams = onSnapshot(teamCollectionRef, (snapshot) => {
                 const teamDataMap = {};
@@ -827,7 +895,7 @@
                 renderApp();
             });
 
-            // 4. Subscribe to Alliance Ledger (Public Data)
+            // 3. Subscribe to Alliance Ledger (Public Data)
             const ledgerCollectionRef = collection(db, `${PUBLIC_DATA_PATH}/alliance_ledger`);
             const unsubscribeLedger = onSnapshot(ledgerCollectionRef, (snapshot) => {
                 ledgerItems = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
